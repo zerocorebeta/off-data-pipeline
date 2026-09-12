@@ -76,7 +76,8 @@ check_local_tools() {
   [[ -x "$ACTIVATE_SCRIPT" ]] || fail "missing executable: $ACTIVATE_SCRIPT"
   [[ -x "$SFTP_SCRIPT" ]] || fail "missing executable: $SFTP_SCRIPT"
   [[ -x "$ROLLBACK_SCRIPT" ]] || fail "missing executable: $ROLLBACK_SCRIPT"
-  bash -n "$SCRIPT_DIR/operator.sh" "$ACTIVATE_SCRIPT" "$SFTP_SCRIPT" "$ROLLBACK_SCRIPT"
+  [[ -x "$SCRIPT_DIR/observe-command.sh" ]] || fail "missing executable: $SCRIPT_DIR/observe-command.sh"
+  bash -n "$SCRIPT_DIR/operator.sh" "$SCRIPT_DIR/observe-command.sh" "$ACTIVATE_SCRIPT" "$SFTP_SCRIPT" "$ROLLBACK_SCRIPT"
 }
 
 run_fixture() {

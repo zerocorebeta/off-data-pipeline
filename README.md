@@ -4,7 +4,9 @@ Small release builder for the hosted Open Food Facts barcode lookup. It reads th
 
 Dedupe is deliberately deterministic. The reader writes bounded sorted JSONL runs (50,000 products by default), then merges those runs and keeps the highest-quality record for each barcode. Ties use the stable serialized record as a lexical tie-breaker. Peak memory is the run size plus one record per run; run files are temporary and removed after the process exits.
 
-A release directory contains `index/` and `off-index-manifest.json`. The manifest includes schema/pipeline/dataset versions, input and normalized-stream checksums, a checksum list for every Tantivy file, and the document count. `verify` rechecks the manifest, every file checksum, required fields, and the Tantivy document count. `package` creates a compressed `.tar.zst` for the server's separate OFF area.
+A release directory contains `index/` and `off-index-manifest.json`. The manifest includes schema/pipeline/dataset versions, input and normalized-stream checksums, a checksum list for every Tantivy file, and the document count. It also records parsed/accepted/skipped counters, skip reasons, external-sort run count, compressed input bytes, and deduped/indexed document counts. `verify` rechecks the manifest, every file checksum, required fields, and the Tantivy document count. `package` creates a compressed `.tar.zst` for the server's separate OFF area.
+
+Build, verify, and package commands emit flushed `OFF_PROGRESS` records to stderr. By default they report every 100,000 records and every 30 seconds; tune this with `--progress-records`, `--progress-interval-ms`, or `--progress-interval-seconds` (the corresponding `OFF_PROGRESS_*` environment variables are also supported). Heartbeats continue during Tantivy commit, hashing, verification, and archive compression.
 
 ## Local build
 
@@ -25,7 +27,7 @@ The official dump is published at `https://static.openfoodfacts.org/data/openfoo
 
 ## Automation
 
-`.github/workflows/off-data-pipeline.yml` is intentionally manual or scheduled. It streams the compressed dump to runner scratch space, checks free disk before and during download, runs the full Rust checks, verifies the release, and uploads only the compressed release over SFTP. It does not use durable GitHub artifact storage. The SFTP key and known-hosts value are injected from secrets; the server-side account should be restricted to the OFF incoming directory and have no shell access.
+`.github/workflows/off-data-pipeline.yml` is intentionally manual or scheduled. It streams the compressed dump to runner scratch space, checks free disk before and during download, runs the full Rust checks, builds and verifies the release in separate timestamped/tee'd steps, and uploads only the compressed release over SFTP. The observer also logs bounded runner disk, memory, load/CPU, and pipeline process snapshots while commands run; the manifest counters are copied to `GITHUB_STEP_SUMMARY`. Job and command timeouts prevent an opaque hang. It does not use durable GitHub artifact storage. The SFTP key and known-hosts value are injected from secrets; the server-side account should be restricted to the OFF incoming directory and have no shell access.
 
 
 ## Operator path

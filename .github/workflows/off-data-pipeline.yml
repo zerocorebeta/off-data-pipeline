@@ -26,6 +26,10 @@ env:
   OFF_MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'fixture' }}
   OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-products.jsonl.gz
   MIN_FREE_KB: 25000000
+  # Keep full-run logs bounded while ensuring both record and wall-clock
+  # telemetry is visible during slow ingestion and index phases.
+  OFF_PROGRESS_RECORDS: 250000
+  OFF_PROGRESS_INTERVAL_SECONDS: 30
 
 jobs:
   build-and-upload:
@@ -65,11 +69,20 @@ jobs:
           set -euo pipefail
           echo 'OFF_INPUT=tests/fixtures/products.jsonl.gz' >> "${GITHUB_ENV}"
       - name: Rust checks
+        shell: bash
         run: |
-          cargo fmt --manifest-path Cargo.toml --check
-          cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path Cargo.toml
-      - name: Build and verify release
+          set -euo pipefail
+          log="${RUNNER_TEMP}/off-rust-checks.log"
+          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            timeout --foreground --signal=TERM --kill-after=60s 30m \
+            cargo fmt --manifest-path Cargo.toml --check
+          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            timeout --foreground --signal=TERM --kill-after=60s 30m \
+            cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
+          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            timeout --foreground --signal=TERM --kill-after=60s 30m \
+            cargo test --locked --manifest-path Cargo.toml
+      - name: Build release
         shell: bash
         run: |
           set -euo pipefail
@@ -83,11 +96,65 @@ jobs:
           # Keep every upload name unique so a retry cannot mix a new archive
           # with an old checksum sidecar while activation is watching incoming/.
           artifact="${RUNNER_TEMP}/off-index-${dataset}-${run_key}.tar.zst"
-          cargo run --locked -- build --input "${OFF_INPUT}" --output "${output}" \
-            --dataset-version "${dataset}" --artifact "${artifact}"
-          cargo run --locked -- verify --release "${output}"
-          sha256sum "${artifact}" > "${artifact}.sha256"
+          build_log="${RUNNER_TEMP}/off-build.log"
+          scripts/observe-command.sh "${build_log}" \
+            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            timeout --foreground --signal=TERM --kill-after=60s 150m \
+            cargo run --locked -- build --input "${OFF_INPUT}" --output "${output}" \
+              --dataset-version "${dataset}" --artifact "${artifact}" \
+              --progress-records "${OFF_PROGRESS_RECORDS}" \
+              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}"
+          test -s "${output}/off-index-manifest.json"
+          test -s "${artifact}"
+          echo "OFF_RELEASE=${output}" >> "${GITHUB_ENV}"
           echo "OFF_ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
+      - name: Verify release
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_log="${RUNNER_TEMP}/off-verify.log"
+          scripts/observe-command.sh "${verify_log}" \
+            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            timeout --foreground --signal=TERM --kill-after=60s 30m \
+            cargo run --locked -- verify --release "${OFF_RELEASE}" \
+              --progress-records "${OFF_PROGRESS_RECORDS}" \
+              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}"
+          sha256sum "${OFF_ARTIFACT}" > "${OFF_ARTIFACT}.sha256"
+      - name: Summarize release counters
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/off-release/off-index-manifest.json"
+          {
+            echo '## Open Food Facts pipeline counters'
+            echo
+            if [[ -s "${manifest}" ]]; then
+              echo '| Counter | Value |'
+              echo '| --- | ---: |'
+              jq -r '
+                "| inputCompressedBytes | \(.inputCompressedBytes) |",
+                "| inputLines | \(.inputLines) |",
+                "| rawParsed | \(.rawParsed) |",
+                "| acceptedProducts | \(.acceptedProducts) |",
+                "| invalidLines | \(.invalidLines) |",
+                "| skippedProducts | \(.skippedProducts) |",
+                "| skippedInvalidBarcode | \(.skippedInvalidBarcode) |",
+                "| skippedMissingName | \(.skippedMissingName) |",
+                "| skippedMissingNutrition | \(.skippedMissingNutrition) |",
+                "| skippedValidation | \(.skippedValidation) |",
+                "| sortRuns | \(.sortRuns) |",
+                "| dedupedDocs | \(.dedupedDocs) |",
+                "| indexedDocs | \(.indexedDocs) |",
+                "| recordCount | \(.recordCount) |"
+              ' "${manifest}"
+              if [[ -s "${OFF_ARTIFACT:-}" ]]; then
+                printf '| artifactBytes | %s |\n' "$(wc -c < "${OFF_ARTIFACT}")"
+              fi
+            else
+              echo 'Manifest was not produced; inspect the timestamped build log above.'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload over restricted SFTP
         if: env.OFF_MODE == 'full'
         shell: bash

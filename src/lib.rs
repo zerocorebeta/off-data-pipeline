@@ -13,6 +13,10 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tantivy::collector::Count;
 use tantivy::schema::{Field, STORED, STRING, TEXT};
 use tantivy::{Index, doc};
@@ -171,9 +175,68 @@ pub struct Manifest {
     pub normalized_sha256: String,
     pub index_sha256: String,
     pub input_lines: u64,
+    #[serde(default)]
+    pub raw_parsed: u64,
+    #[serde(default)]
+    pub accepted_products: u64,
     pub invalid_lines: u64,
     pub skipped_products: u64,
+    #[serde(default)]
+    pub skipped_invalid_barcode: u64,
+    #[serde(default)]
+    pub skipped_missing_name: u64,
+    #[serde(default)]
+    pub skipped_missing_nutrition: u64,
+    #[serde(default)]
+    pub skipped_validation: u64,
+    #[serde(default)]
+    pub sort_runs: u64,
+    #[serde(default)]
+    pub deduped_docs: usize,
+    #[serde(default)]
+    pub indexed_docs: usize,
+    #[serde(default)]
+    pub input_compressed_bytes: u64,
     pub files: Vec<ManifestFile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressOptions {
+    /// Emit a record-triggered event after this many records. Zero disables
+    /// record-triggered events; wall-clock heartbeats remain enabled.
+    pub record_interval: u64,
+    /// Emit a heartbeat at least this often, including during blocking phases.
+    pub wall_interval: Duration,
+}
+
+impl Default for ProgressOptions {
+    fn default() -> Self {
+        Self {
+            record_interval: 100_000,
+            wall_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ProgressOptions {
+    pub fn new(record_interval: u64, wall_interval: Duration) -> Result<Self, String> {
+        if wall_interval.is_zero() {
+            return Err("progress wall interval must be positive".into());
+        }
+        Ok(Self {
+            record_interval,
+            wall_interval,
+        })
+    }
+
+    fn validate(self) -> Result<(), PipelineError> {
+        if self.wall_interval.is_zero() {
+            return Err(PipelineError::InvalidRelease(
+                "progress wall interval must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,9 +251,379 @@ pub struct BuildOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BuildStats {
     pub input_lines: u64,
+    pub raw_parsed: u64,
+    pub accepted_products: u64,
     pub invalid_lines: u64,
     pub skipped_products: u64,
+    pub skipped_invalid_barcode: u64,
+    pub skipped_missing_name: u64,
+    pub skipped_missing_nutrition: u64,
+    pub skipped_validation: u64,
+    pub sort_runs: u64,
     pub record_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct EmitState {
+    record_cursor: u64,
+    at: Instant,
+}
+
+struct ProgressShared {
+    options: ProgressOptions,
+    started: Instant,
+    phase: Mutex<String>,
+    record_cursor: AtomicU64,
+    input_lines: AtomicU64,
+    raw_parsed: AtomicU64,
+    accepted_products: AtomicU64,
+    invalid_lines: AtomicU64,
+    skipped_products: AtomicU64,
+    skipped_invalid_barcode: AtomicU64,
+    skipped_missing_name: AtomicU64,
+    skipped_missing_nutrition: AtomicU64,
+    skipped_validation: AtomicU64,
+    sort_runs: AtomicU64,
+    deduped_docs: AtomicU64,
+    indexed_docs: AtomicU64,
+    input_bytes: AtomicU64,
+    compressed_bytes: AtomicU64,
+    compressed_total: AtomicU64,
+    phase_bytes: AtomicU64,
+    phase_files: AtomicU64,
+    last_emit: Mutex<EmitState>,
+    output: Mutex<Box<dyn Write + Send>>,
+    stop: Mutex<bool>,
+    wake: Condvar,
+    worker_error: Mutex<Option<String>>,
+}
+
+impl ProgressShared {
+    fn new<W: Write + Send + 'static>(options: ProgressOptions, output: W) -> Self {
+        let now = Instant::now();
+        Self {
+            options,
+            started: now,
+            phase: Mutex::new("startup".into()),
+            record_cursor: AtomicU64::new(0),
+            input_lines: AtomicU64::new(0),
+            raw_parsed: AtomicU64::new(0),
+            accepted_products: AtomicU64::new(0),
+            invalid_lines: AtomicU64::new(0),
+            skipped_products: AtomicU64::new(0),
+            skipped_invalid_barcode: AtomicU64::new(0),
+            skipped_missing_name: AtomicU64::new(0),
+            skipped_missing_nutrition: AtomicU64::new(0),
+            skipped_validation: AtomicU64::new(0),
+            sort_runs: AtomicU64::new(0),
+            deduped_docs: AtomicU64::new(0),
+            indexed_docs: AtomicU64::new(0),
+            input_bytes: AtomicU64::new(0),
+            compressed_bytes: AtomicU64::new(0),
+            compressed_total: AtomicU64::new(0),
+            phase_bytes: AtomicU64::new(0),
+            phase_files: AtomicU64::new(0),
+            last_emit: Mutex::new(EmitState {
+                record_cursor: 0,
+                at: now,
+            }),
+            output: Mutex::new(Box::new(output)),
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+            worker_error: Mutex::new(None),
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_worker_error(&self, error: io::Error) {
+        let mut worker_error = Self::lock(&self.worker_error);
+        if worker_error.is_none() {
+            *worker_error = Some(error.to_string());
+        }
+    }
+
+    fn stop_now(&self) {
+        *Self::lock(&self.stop) = true;
+        self.wake.notify_all();
+    }
+
+    fn emit_if_due(&self, force: bool) -> io::Result<bool> {
+        let now = Instant::now();
+        let record_cursor = self.record_cursor.load(AtomicOrdering::Relaxed);
+        let mut last_emit = Self::lock(&self.last_emit);
+        let records_due = self.options.record_interval > 0
+            && record_cursor.saturating_sub(last_emit.record_cursor)
+                >= self.options.record_interval;
+        let time_due = now.duration_since(last_emit.at) >= self.options.wall_interval;
+        if !force && !records_due && !time_due {
+            return Ok(false);
+        }
+        let phase = Self::lock(&self.phase).clone();
+        let elapsed = now.duration_since(self.started);
+        let elapsed_seconds = elapsed.as_secs_f64();
+        let throughput = if elapsed_seconds > 0.0 {
+            record_cursor as f64 / elapsed_seconds
+        } else {
+            0.0
+        };
+        let compressed_total = self.compressed_total.load(AtomicOrdering::Relaxed);
+        let line = format!(
+            "OFF_PROGRESS phase={phase} elapsed_ms={} throughput_records_per_sec={throughput:.2} compressed_bytes={}/{} input_bytes={} input_lines={} raw_parsed={} accepted={} invalid_lines={} skipped={} skipped_invalid_barcode={} skipped_missing_name={} skipped_missing_nutrition={} skipped_validation={} sort_runs={} deduped_docs={} indexed_docs={} phase_bytes={} phase_files={}",
+            elapsed.as_millis(),
+            self.compressed_bytes.load(AtomicOrdering::Relaxed),
+            compressed_total,
+            self.input_bytes.load(AtomicOrdering::Relaxed),
+            self.input_lines.load(AtomicOrdering::Relaxed),
+            self.raw_parsed.load(AtomicOrdering::Relaxed),
+            self.accepted_products.load(AtomicOrdering::Relaxed),
+            self.invalid_lines.load(AtomicOrdering::Relaxed),
+            self.skipped_products.load(AtomicOrdering::Relaxed),
+            self.skipped_invalid_barcode.load(AtomicOrdering::Relaxed),
+            self.skipped_missing_name.load(AtomicOrdering::Relaxed),
+            self.skipped_missing_nutrition.load(AtomicOrdering::Relaxed),
+            self.skipped_validation.load(AtomicOrdering::Relaxed),
+            self.sort_runs.load(AtomicOrdering::Relaxed),
+            self.deduped_docs.load(AtomicOrdering::Relaxed),
+            self.indexed_docs.load(AtomicOrdering::Relaxed),
+            self.phase_bytes.load(AtomicOrdering::Relaxed),
+            self.phase_files.load(AtomicOrdering::Relaxed),
+        );
+        let mut output = Self::lock(&self.output);
+        writeln!(output, "{line}")?;
+        output.flush()?;
+        last_emit.record_cursor = record_cursor;
+        last_emit.at = now;
+        Ok(true)
+    }
+
+    fn worker_error(&self) -> Option<String> {
+        Self::lock(&self.worker_error).clone()
+    }
+}
+
+/// Bounded progress telemetry for long-running releases.
+///
+/// Events are written as one-line key/value records to stderr and flushed after
+/// every line. Record-triggered events are throttled by `record_interval`; a
+/// small background heartbeat also covers phases that do not move records,
+/// such as Tantivy commit, checksum hashing, and archive compression.
+pub struct ProgressReporter {
+    shared: Arc<ProgressShared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ProgressReporter {
+    pub fn new(options: ProgressOptions) -> Result<Self, PipelineError> {
+        Self::with_writer(options, io::stderr())
+    }
+
+    pub fn with_writer<W: Write + Send + 'static>(
+        options: ProgressOptions,
+        output: W,
+    ) -> Result<Self, PipelineError> {
+        options.validate()?;
+        let shared = Arc::new(ProgressShared::new(options, output));
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("off-progress-heartbeat".into())
+            .spawn(move || {
+                loop {
+                    let guard = ProgressShared::lock(&worker_shared.stop);
+                    let (guard, _) = worker_shared
+                        .wake
+                        .wait_timeout(guard, worker_shared.options.wall_interval)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *guard {
+                        break;
+                    }
+                    drop(guard);
+                    if let Err(error) = worker_shared.emit_if_due(false) {
+                        worker_shared.set_worker_error(error);
+                        worker_shared.stop_now();
+                        break;
+                    }
+                }
+            })
+            .map_err(PipelineError::Io)?;
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+
+    fn check_worker_error(&self) -> Result<(), PipelineError> {
+        if let Some(error) = self.shared.worker_error() {
+            return Err(PipelineError::Io(io::Error::other(error)));
+        }
+        Ok(())
+    }
+
+    fn emit_if_due(&self, force: bool) -> Result<(), PipelineError> {
+        self.shared
+            .emit_if_due(force)
+            .map(|_| ())
+            .map_err(PipelineError::Io)
+    }
+
+    fn change_phase(&self, phase: &str, emit: bool) -> Result<(), PipelineError> {
+        let should_emit_previous =
+            emit && ProgressShared::lock(&self.shared.phase).as_str() != "startup";
+        if should_emit_previous {
+            self.emit_if_due(true)?;
+        }
+        let phase = phase
+            .chars()
+            .take(32)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        *ProgressShared::lock(&self.shared.phase) = if phase.is_empty() {
+            "unknown".into()
+        } else {
+            phase
+        };
+        self.shared.phase_bytes.store(0, AtomicOrdering::Relaxed);
+        self.shared.phase_files.store(0, AtomicOrdering::Relaxed);
+        if emit {
+            self.emit_if_due(true)?;
+        }
+        self.check_worker_error()
+    }
+
+    pub fn set_phase(&self, phase: &str) -> Result<(), PipelineError> {
+        self.change_phase(phase, true)
+    }
+
+    fn publish_stats(
+        &self,
+        stats: &BuildStats,
+        input_bytes: u64,
+        compressed_bytes: u64,
+        compressed_total: u64,
+    ) {
+        self.shared
+            .input_lines
+            .store(stats.input_lines, AtomicOrdering::Relaxed);
+        self.shared
+            .raw_parsed
+            .store(stats.raw_parsed, AtomicOrdering::Relaxed);
+        self.shared
+            .accepted_products
+            .store(stats.accepted_products, AtomicOrdering::Relaxed);
+        self.shared
+            .invalid_lines
+            .store(stats.invalid_lines, AtomicOrdering::Relaxed);
+        self.shared
+            .skipped_products
+            .store(stats.skipped_products, AtomicOrdering::Relaxed);
+        self.shared
+            .skipped_invalid_barcode
+            .store(stats.skipped_invalid_barcode, AtomicOrdering::Relaxed);
+        self.shared
+            .skipped_missing_name
+            .store(stats.skipped_missing_name, AtomicOrdering::Relaxed);
+        self.shared
+            .skipped_missing_nutrition
+            .store(stats.skipped_missing_nutrition, AtomicOrdering::Relaxed);
+        self.shared
+            .skipped_validation
+            .store(stats.skipped_validation, AtomicOrdering::Relaxed);
+        self.shared
+            .sort_runs
+            .store(stats.sort_runs, AtomicOrdering::Relaxed);
+        self.shared
+            .input_bytes
+            .store(input_bytes, AtomicOrdering::Relaxed);
+        self.shared
+            .compressed_bytes
+            .store(compressed_bytes, AtomicOrdering::Relaxed);
+        self.shared
+            .compressed_total
+            .store(compressed_total, AtomicOrdering::Relaxed);
+        self.shared
+            .deduped_docs
+            .store(stats.record_count as u64, AtomicOrdering::Relaxed);
+        self.shared
+            .indexed_docs
+            .store(stats.record_count as u64, AtomicOrdering::Relaxed);
+    }
+
+    fn record(&self) -> Result<(), PipelineError> {
+        let cursor = self
+            .shared
+            .record_cursor
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if self.shared.options.record_interval > 0
+            && cursor.is_multiple_of(self.shared.options.record_interval)
+        {
+            self.emit_if_due(false)?;
+        }
+        self.check_worker_error()
+    }
+
+    fn set_indexed_docs(&self, count: usize) -> Result<(), PipelineError> {
+        self.shared
+            .deduped_docs
+            .store(count as u64, AtomicOrdering::Relaxed);
+        self.shared
+            .indexed_docs
+            .store(count as u64, AtomicOrdering::Relaxed);
+        self.check_worker_error()
+    }
+
+    fn add_phase_bytes(&self, bytes: u64) -> Result<(), PipelineError> {
+        self.shared
+            .phase_bytes
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.check_worker_error()
+    }
+
+    fn add_phase_file(&self) -> Result<(), PipelineError> {
+        self.shared
+            .phase_files
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.check_worker_error()
+    }
+
+    pub fn complete(&mut self) -> Result<(), PipelineError> {
+        self.emit_if_due(true)?;
+        self.change_phase("complete", false)?;
+        self.finish()
+    }
+
+    pub fn finish(&mut self) -> Result<(), PipelineError> {
+        self.stop_worker();
+        self.check_worker_error()?;
+        self.emit_if_due(true)
+    }
+
+    pub fn abort(&mut self) {
+        self.stop_worker();
+    }
+
+    fn stop_worker(&mut self) {
+        self.shared.stop_now();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        self.stop_worker();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +761,33 @@ pub fn valid_barcode(value: &str) -> bool {
     (8..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+struct CountingReader<R> {
+    inner: R,
+    bytes: Arc<AtomicU64>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, bytes: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes.fetch_add(count as u64, AtomicOrdering::Relaxed);
+        Ok(count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipReason {
+    InvalidBarcode,
+    MissingName,
+    MissingNutrition,
+    Validation,
+}
+
 fn string_value(value: &Value, keys: &[&str]) -> String {
     keys.iter()
         .find_map(|key| value.get(*key))
@@ -408,10 +868,10 @@ fn country_values(value: &Value) -> Vec<String> {
 
 /// Convert one raw OFF object into the stable, intentionally small product model.
 /// Products with no usable name, barcode, or nutrition are omitted.
-pub fn normalize_product(raw: &Value) -> Option<OffProduct> {
+fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> {
     let barcode = string_value(raw, &["code", "barcode", "_id"]);
     if !valid_barcode(&barcode) {
-        return None;
+        return Err(SkipReason::InvalidBarcode);
     }
     let generic_name = string_value(raw, &["generic_name", "generic_name_en"]);
     let name = string_value(
@@ -424,7 +884,7 @@ pub fn normalize_product(raw: &Value) -> Option<OffProduct> {
         name
     };
     if name.is_empty() {
-        return None;
+        return Err(SkipReason::MissingName);
     }
     let nutriments = raw.get("nutriments").unwrap_or(raw);
     let energy_kcal_100g = non_negative_number(
@@ -461,7 +921,7 @@ pub fn normalize_product(raw: &Value) -> Option<OffProduct> {
     .iter()
     .all(Option::is_none)
     {
-        return None;
+        return Err(SkipReason::MissingNutrition);
     }
     let off_product_id = string_value(raw, &["_id", "id", "code"]);
     let off_product_id = if off_product_id.is_empty() {
@@ -498,8 +958,12 @@ pub fn normalize_product(raw: &Value) -> Option<OffProduct> {
             .map(|value| value as i64),
         source: SOURCE.into(),
     };
-    product.validate().ok()?;
-    Some(product)
+    product.validate().map_err(|_| SkipReason::Validation)?;
+    Ok(product)
+}
+
+pub fn normalize_product(raw: &Value) -> Option<OffProduct> {
+    normalize_product_with_reason(raw).ok()
 }
 
 fn product_sort(a: &OffProduct, b: &OffProduct) -> Ordering {
@@ -509,7 +973,7 @@ fn product_sort(a: &OffProduct, b: &OffProduct) -> Ordering {
         .then_with(|| a.canonical_json().cmp(&b.canonical_json()))
 }
 
-fn hash_file(path: &Path) -> Result<String, PipelineError> {
+fn hash_file(path: &Path, reporter: Option<&ProgressReporter>) -> Result<String, PipelineError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -519,6 +983,12 @@ fn hash_file(path: &Path) -> Result<String, PipelineError> {
             break;
         }
         hasher.update(&buffer[..count]);
+        if let Some(reporter) = reporter {
+            reporter.add_phase_bytes(count as u64)?;
+        }
+    }
+    if let Some(reporter) = reporter {
+        reporter.add_phase_file()?;
     }
     Ok(hex_encode(hasher.finalize()))
 }
@@ -649,14 +1119,20 @@ fn collect_runs(
     input: &Path,
     temp: &Path,
     chunk_size: usize,
+    reporter: &ProgressReporter,
 ) -> Result<(Vec<PathBuf>, BuildStats), PipelineError> {
-    let input_file = File::open(input)?;
+    let compressed_total = fs::metadata(input)?.len();
+    let compressed_bytes = Arc::new(AtomicU64::new(0));
+    let decompressed_bytes = Arc::new(AtomicU64::new(0));
+    let input_file = CountingReader::new(File::open(input)?, Arc::clone(&compressed_bytes));
     let decoder = MultiGzDecoder::new(BufReader::new(input_file));
-    let mut reader = BufReader::new(decoder);
+    let counted_decoder = CountingReader::new(decoder, Arc::clone(&decompressed_bytes));
+    let mut reader = BufReader::new(counted_decoder);
     let mut products = Vec::with_capacity(chunk_size);
     let mut runs = Vec::new();
     let mut stats = BuildStats::default();
     let mut line = String::new();
+    reporter.publish_stats(&stats, 0, 0, compressed_total);
     loop {
         let line_len = read_bounded_line(&mut reader, &mut line)?;
         if line_len == 0 {
@@ -665,31 +1141,71 @@ fn collect_runs(
         stats.input_lines += 1;
         if line_len > MAX_LINE_BYTES {
             stats.invalid_lines += 1;
+            reporter.publish_stats(
+                &stats,
+                decompressed_bytes.load(AtomicOrdering::Relaxed),
+                compressed_bytes.load(AtomicOrdering::Relaxed),
+                compressed_total,
+            );
+            reporter.record()?;
             continue;
         }
         let raw = match serde_json::from_str::<Value>(line.trim_end()) {
             Ok(value) => value,
             Err(_) => {
                 stats.invalid_lines += 1;
+                reporter.publish_stats(
+                    &stats,
+                    decompressed_bytes.load(AtomicOrdering::Relaxed),
+                    compressed_bytes.load(AtomicOrdering::Relaxed),
+                    compressed_total,
+                );
+                reporter.record()?;
                 continue;
             }
         };
-        if let Some(product) = normalize_product(&raw) {
-            products.push(product);
-            if products.len() >= chunk_size {
-                let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
-                write_run(&path, &mut products)?;
-                runs.push(path);
+        stats.raw_parsed += 1;
+        match normalize_product_with_reason(&raw) {
+            Ok(product) => {
+                stats.accepted_products += 1;
+                products.push(product);
+                if products.len() >= chunk_size {
+                    let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
+                    write_run(&path, &mut products)?;
+                    runs.push(path);
+                    stats.sort_runs = runs.len() as u64;
+                }
             }
-        } else {
-            stats.skipped_products += 1;
+            Err(reason) => {
+                stats.skipped_products += 1;
+                match reason {
+                    SkipReason::InvalidBarcode => stats.skipped_invalid_barcode += 1,
+                    SkipReason::MissingName => stats.skipped_missing_name += 1,
+                    SkipReason::MissingNutrition => stats.skipped_missing_nutrition += 1,
+                    SkipReason::Validation => stats.skipped_validation += 1,
+                }
+            }
         }
+        reporter.publish_stats(
+            &stats,
+            decompressed_bytes.load(AtomicOrdering::Relaxed),
+            compressed_bytes.load(AtomicOrdering::Relaxed),
+            compressed_total,
+        );
+        reporter.record()?;
     }
     if !products.is_empty() {
         let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
         write_run(&path, &mut products)?;
         runs.push(path);
     }
+    stats.sort_runs = runs.len() as u64;
+    reporter.publish_stats(
+        &stats,
+        decompressed_bytes.load(AtomicOrdering::Relaxed),
+        compressed_bytes.load(AtomicOrdering::Relaxed),
+        compressed_total,
+    );
     Ok((runs, stats))
 }
 
@@ -697,7 +1213,9 @@ fn merge_runs(
     runs: &[PathBuf],
     index: &Index,
     fields: IndexFields,
+    reporter: &ProgressReporter,
 ) -> Result<(usize, String), PipelineError> {
+    reporter.set_phase("merge")?;
     let mut readers = runs
         .iter()
         .map(|path| File::open(path).map(BufReader::new))
@@ -723,6 +1241,8 @@ fn merge_runs(
         normalized_hasher.update(b"\n");
         add_product(&mut writer, fields, &selected)?;
         count += 1;
+        reporter.set_indexed_docs(count)?;
+        reporter.record()?;
         if let Some(product) = next_product(&mut readers[item.run])? {
             heap.push(HeapItem {
                 sort_key: product_sort_key(&product),
@@ -747,22 +1267,30 @@ fn merge_runs(
             }
         }
     }
+    // Commit and segment merging can take much longer than the record loop;
+    // the reporter heartbeat continues while these blocking calls run.
+    reporter.set_phase("tantivy_commit")?;
     writer.commit()?;
     writer.wait_merging_threads()?;
+    reporter.set_indexed_docs(count)?;
     Ok((count, hex_encode(normalized_hasher.finalize())))
 }
 
-fn collect_index_files(index_root: &Path) -> Result<Vec<ManifestFile>, PipelineError> {
+fn collect_index_files(
+    index_root: &Path,
+    reporter: Option<&ProgressReporter>,
+) -> Result<Vec<ManifestFile>, PipelineError> {
     fn visit(
         root: &Path,
         current: &Path,
         files: &mut Vec<ManifestFile>,
+        reporter: Option<&ProgressReporter>,
     ) -> Result<(), PipelineError> {
         for entry in fs::read_dir(current)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                visit(root, &path, files)?;
+                visit(root, &path, files, reporter)?;
             } else if path.is_file() {
                 let relative = path.strip_prefix(root).map_err(|_| {
                     PipelineError::InvalidRelease("file escaped release root".into())
@@ -776,14 +1304,14 @@ fn collect_index_files(index_root: &Path) -> Result<Vec<ManifestFile>, PipelineE
                 files.push(ManifestFile {
                     path: path_string,
                     bytes: metadata.len(),
-                    sha256: hash_file(&path)?,
+                    sha256: hash_file(&path, reporter)?,
                 });
             }
         }
         Ok(())
     }
     let mut files = Vec::new();
-    visit(index_root, index_root, &mut files)?;
+    visit(index_root, index_root, &mut files, reporter)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
@@ -824,6 +1352,33 @@ fn valid_dataset_version(value: &str) -> bool {
 
 /// Build a complete release root and optionally a `.tar.zst` artifact.
 pub fn build_release(options: &BuildOptions) -> Result<Manifest, PipelineError> {
+    let mut reporter = ProgressReporter::new(ProgressOptions::default())?;
+    build_release_with_progress(options, &mut reporter)
+}
+
+/// Build a release while sending progress events to the supplied reporter.
+/// The reporter is completed or stopped before this function returns.
+pub fn build_release_with_progress(
+    options: &BuildOptions,
+    reporter: &mut ProgressReporter,
+) -> Result<Manifest, PipelineError> {
+    let result = build_release_inner(options, reporter);
+    match result {
+        Ok(manifest) => {
+            reporter.complete()?;
+            Ok(manifest)
+        }
+        Err(error) => {
+            reporter.abort();
+            Err(error)
+        }
+    }
+}
+
+fn build_release_inner(
+    options: &BuildOptions,
+    reporter: &ProgressReporter,
+) -> Result<Manifest, PipelineError> {
     if options.chunk_size == 0 {
         return Err(PipelineError::InvalidRelease(
             "chunk size must be positive".into(),
@@ -849,43 +1404,85 @@ pub fn build_release(options: &BuildOptions) -> Result<Manifest, PipelineError> 
     fs::create_dir_all(options.output.join("index"))?;
     let temporary =
         tempfile::tempdir_in(options.output.parent().unwrap_or_else(|| Path::new(".")))?;
-    let (runs, mut stats) = collect_runs(&options.input, temporary.path(), options.chunk_size)?;
+    reporter.set_phase("ingest")?;
+    let (runs, mut stats) = collect_runs(
+        &options.input,
+        temporary.path(),
+        options.chunk_size,
+        reporter,
+    )?;
+    reporter.set_phase("external_sort")?;
     let (schema, fields) = build_schema();
     let index = Index::create_in_dir(options.output.join("index"), schema)?;
-    let (count, normalized_sha256) = merge_runs(&runs, &index, fields)?;
+    let (count, normalized_sha256) = merge_runs(&runs, &index, fields, reporter)?;
     stats.record_count = count;
+    reporter.set_indexed_docs(count)?;
     // These locks belong to the build process, not the read-mostly release.
     // Leaving them in the archive can make a root-built release unwritable by
     // the service account on the first startup.
     for lock in [".tantivy-meta.lock", ".tantivy-writer.lock"] {
         let _ = fs::remove_file(options.output.join("index").join(lock));
     }
-    let files = collect_index_files(&options.output.join("index"))?;
+    reporter.set_phase("hash")?;
+    let input_compressed_bytes = fs::metadata(&options.input)?.len();
+    let input_sha256 = hash_file(&options.input, Some(reporter))?;
+    let files = collect_index_files(&options.output.join("index"), Some(reporter))?;
     let manifest = Manifest {
         schema_version: INDEX_SCHEMA_VERSION,
         pipeline_version: env!("CARGO_PKG_VERSION").into(),
         dataset_version: options.dataset_version.clone(),
         source: SOURCE.into(),
         record_count: count,
-        input_sha256: hash_file(&options.input)?,
+        input_sha256,
         normalized_sha256,
         index_sha256: files_checksum(&files),
         input_lines: stats.input_lines,
+        raw_parsed: stats.raw_parsed,
+        accepted_products: stats.accepted_products,
         invalid_lines: stats.invalid_lines,
         skipped_products: stats.skipped_products,
+        skipped_invalid_barcode: stats.skipped_invalid_barcode,
+        skipped_missing_name: stats.skipped_missing_name,
+        skipped_missing_nutrition: stats.skipped_missing_nutrition,
+        skipped_validation: stats.skipped_validation,
+        sort_runs: stats.sort_runs,
+        deduped_docs: count,
+        indexed_docs: count,
+        input_compressed_bytes,
         files,
     };
+    reporter.set_phase("manifest")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     fs::write(options.output.join(MANIFEST_FILE), manifest_bytes)?;
-    verify_release(&options.output)?;
+    verify_release_with_progress(&options.output, reporter)?;
     if let Some(artifact) = &options.artifact {
-        package_release(&options.output, artifact)?;
+        package_release_with_progress(&options.output, artifact, reporter)?;
     }
     Ok(manifest)
 }
 
 /// Validate manifest checksums, schema, and Tantivy document count.
 pub fn verify_release(root: &Path) -> Result<Manifest, PipelineError> {
+    let mut reporter = ProgressReporter::new(ProgressOptions::default())?;
+    let result = verify_release_with_progress(root, &reporter);
+    match result {
+        Ok(manifest) => {
+            reporter.complete()?;
+            Ok(manifest)
+        }
+        Err(error) => {
+            reporter.abort();
+            Err(error)
+        }
+    }
+}
+
+/// Validate a release while sending progress events to the supplied reporter.
+pub fn verify_release_with_progress(
+    root: &Path,
+    reporter: &ProgressReporter,
+) -> Result<Manifest, PipelineError> {
+    reporter.set_phase("verify")?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest: Manifest = serde_json::from_reader(BufReader::new(File::open(&manifest_path)?))?;
     if manifest.schema_version != INDEX_SCHEMA_VERSION || manifest.source != SOURCE {
@@ -937,7 +1534,7 @@ pub fn verify_release(root: &Path) -> Result<Manifest, PipelineError> {
                 file.path
             )));
         }
-        if metadata.len() != file.bytes || hash_file(&path)? != file.sha256 {
+        if metadata.len() != file.bytes || hash_file(&path, Some(reporter))? != file.sha256 {
             return Err(PipelineError::InvalidRelease(format!(
                 "checksum mismatch: {}",
                 file.path
@@ -1026,6 +1623,7 @@ fn append_archive_file<W: Write>(
     archive: &mut W,
     path: &Path,
     name: &str,
+    reporter: &ProgressReporter,
 ) -> Result<(), PipelineError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -1036,12 +1634,23 @@ fn append_archive_file<W: Write>(
     }
     let header = tar_header(name, metadata.len(), 0o640, b'0')?;
     archive.write_all(&header)?;
+    reporter.add_phase_bytes(header.len() as u64)?;
     let mut file = File::open(path)?;
-    io::copy(&mut file, archive)?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        archive.write_all(&buffer[..count])?;
+        reporter.add_phase_bytes(count as u64)?;
+    }
     let padding = (512 - (metadata.len() % 512)) % 512;
     if padding > 0 {
         archive.write_all(&vec![0_u8; padding as usize])?;
+        reporter.add_phase_bytes(padding)?;
     }
+    reporter.add_phase_file()?;
     Ok(())
 }
 
@@ -1049,6 +1658,7 @@ fn append_archive_tree<W: Write>(
     archive: &mut W,
     root: &Path,
     current: &Path,
+    reporter: &ProgressReporter,
 ) -> Result<(), PipelineError> {
     let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1056,7 +1666,7 @@ fn append_archive_tree<W: Write>(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_dir() {
-            append_archive_tree(archive, root, &path)?;
+            append_archive_tree(archive, root, &path, reporter)?;
         } else if metadata.file_type().is_file() {
             if matches!(
                 path.file_name().and_then(|value| value.to_str()),
@@ -1072,7 +1682,7 @@ fn append_archive_tree<W: Write>(
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            append_archive_file(archive, &path, &format!("index/{name}"))?;
+            append_archive_file(archive, &path, &format!("index/{name}"), reporter)?;
         } else {
             return Err(PipelineError::InvalidRelease(format!(
                 "archive source is not a regular file or directory: {}",
@@ -1085,15 +1695,44 @@ fn append_archive_tree<W: Write>(
 
 /// Create a compressed tar archive containing `index/` and the manifest.
 pub fn package_release(root: &Path, artifact: &Path) -> Result<(), PipelineError> {
-    verify_release(root)?;
+    let mut reporter = ProgressReporter::new(ProgressOptions::default())?;
+    let result = package_release_with_progress(root, artifact, &reporter);
+    match result {
+        Ok(()) => reporter.complete(),
+        Err(error) => {
+            reporter.abort();
+            Err(error)
+        }
+    }
+}
+
+/// Create an archive while sending progress events to the supplied reporter.
+pub fn package_release_with_progress(
+    root: &Path,
+    artifact: &Path,
+    reporter: &ProgressReporter,
+) -> Result<(), PipelineError> {
+    verify_release_with_progress(root, reporter)?;
+    reporter.set_phase("package")?;
     if let Some(parent) = artifact.parent() {
         fs::create_dir_all(parent)?;
     }
     let output = File::create(artifact)?;
     let mut encoder = zstd::stream::write::Encoder::new(output, 6)?;
-    append_archive_tree(&mut encoder, &root.join("index"), &root.join("index"))?;
-    append_archive_file(&mut encoder, &root.join(MANIFEST_FILE), MANIFEST_FILE)?;
+    append_archive_tree(
+        &mut encoder,
+        &root.join("index"),
+        &root.join("index"),
+        reporter,
+    )?;
+    append_archive_file(
+        &mut encoder,
+        &root.join(MANIFEST_FILE),
+        MANIFEST_FILE,
+        reporter,
+    )?;
     encoder.write_all(&[0_u8; 1024])?;
+    reporter.add_phase_bytes(1024)?;
     encoder.finish()?.sync_all()?;
     Ok(())
 }
@@ -1186,5 +1825,83 @@ mod tests {
         let mut output = String::new();
         decoder.read_to_string(&mut output).unwrap();
         assert!(output.contains("12345678"));
+    }
+
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            ProgressShared::lock(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn progress_reports_phases_and_counters_with_tiny_intervals() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let output = root.path().join("release");
+        let artifact = root.path().join("off-index.tar.zst");
+        let progress_options = ProgressOptions::new(1, Duration::from_millis(1)).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut reporter =
+            ProgressReporter::with_writer(progress_options, CapturingWriter(Arc::clone(&log)))
+                .unwrap();
+        let manifest = build_release_with_progress(
+            &BuildOptions {
+                input: PathBuf::from("tests/fixtures/products.jsonl.gz"),
+                output,
+                artifact: Some(artifact),
+                dataset_version: "fixture-progress".into(),
+                chunk_size: 1,
+            },
+            &mut reporter,
+        )
+        .expect("build succeeds");
+        let logs = String::from_utf8(ProgressShared::lock(&log).clone()).unwrap();
+        for phase in [
+            "ingest",
+            "external_sort",
+            "merge",
+            "tantivy_commit",
+            "hash",
+            "manifest",
+            "verify",
+            "package",
+            "complete",
+        ] {
+            assert!(
+                logs.contains(&format!("phase={phase}")),
+                "missing phase {phase}: {logs}"
+            );
+        }
+        for count in [
+            ("input_lines", manifest.input_lines),
+            ("raw_parsed", manifest.raw_parsed),
+            ("accepted", manifest.accepted_products),
+            ("invalid_lines", manifest.invalid_lines),
+            ("skipped", manifest.skipped_products),
+            ("skipped_invalid_barcode", manifest.skipped_invalid_barcode),
+            ("skipped_missing_name", manifest.skipped_missing_name),
+            (
+                "skipped_missing_nutrition",
+                manifest.skipped_missing_nutrition,
+            ),
+            ("sort_runs", manifest.sort_runs),
+            ("deduped_docs", manifest.deduped_docs as u64),
+            ("indexed_docs", manifest.indexed_docs as u64),
+        ] {
+            assert!(
+                logs.contains(&format!("{0}={1}", count.0, count.1)),
+                "missing {count:?}: {logs}"
+            );
+        }
+        assert!(logs.contains("throughput_records_per_sec="));
+        assert!(logs.contains("compressed_bytes="));
+        assert!(logs.contains("input_bytes="));
     }
 }
