@@ -12,6 +12,8 @@ fn fixture_builds_deduped_checksum_verified_release_and_archive() {
         artifact: Some(artifact.clone()),
         dataset_version: "fixture-2026-01".into(),
         chunk_size: 1,
+        worker_threads: 2,
+        index_memory_bytes: 64 * 1024 * 1024,
     })
     .expect("build succeeds");
     assert_eq!(manifest.record_count, 2);

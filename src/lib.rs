@@ -5,6 +5,7 @@
 //! merge, so memory is bounded by `chunk_size` plus one record per run.
 
 use flate2::read::MultiGzDecoder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -246,6 +247,8 @@ pub struct BuildOptions {
     pub artifact: Option<PathBuf>,
     pub dataset_version: String,
     pub chunk_size: usize,
+    pub worker_threads: usize,
+    pub index_memory_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -993,8 +996,12 @@ fn hash_file(path: &Path, reporter: Option<&ProgressReporter>) -> Result<String,
     Ok(hex_encode(hasher.finalize()))
 }
 
-fn write_run(path: &Path, products: &mut Vec<OffProduct>) -> Result<(), PipelineError> {
-    products.sort_by(product_sort);
+fn write_run(
+    path: &Path,
+    products: &mut Vec<OffProduct>,
+    pool: &rayon::ThreadPool,
+) -> Result<(), PipelineError> {
+    pool.install(|| products.par_sort_by(product_sort));
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     for product in products.drain(..) {
@@ -1119,8 +1126,14 @@ fn collect_runs(
     input: &Path,
     temp: &Path,
     chunk_size: usize,
+    worker_threads: usize,
     reporter: &ProgressReporter,
 ) -> Result<(Vec<PathBuf>, BuildStats), PipelineError> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .thread_name(|index| format!("off-ingest-{index}"))
+        .build()
+        .map_err(|error| PipelineError::InvalidRelease(error.to_string()))?;
     let compressed_total = fs::metadata(input)?.len();
     let compressed_bytes = Arc::new(AtomicU64::new(0));
     let decompressed_bytes = Arc::new(AtomicU64::new(0));
@@ -1132,6 +1145,7 @@ fn collect_runs(
     let mut runs = Vec::new();
     let mut stats = BuildStats::default();
     let mut line = String::new();
+    let batch_size = worker_threads.saturating_mul(256).max(256);
     reporter.publish_stats(&stats, 0, 0, compressed_total);
     loop {
         let line_len = read_bounded_line(&mut reader, &mut line)?;
@@ -1150,41 +1164,57 @@ fn collect_runs(
             reporter.record()?;
             continue;
         }
-        let raw = match serde_json::from_str::<Value>(line.trim_end()) {
-            Ok(value) => value,
-            Err(_) => {
+        let mut lines = vec![std::mem::take(&mut line)];
+        while lines.len() < batch_size {
+            let mut next = String::new();
+            let next_len = read_bounded_line(&mut reader, &mut next)?;
+            if next_len == 0 {
+                break;
+            }
+            stats.input_lines += 1;
+            if next_len > MAX_LINE_BYTES {
                 stats.invalid_lines += 1;
-                reporter.publish_stats(
-                    &stats,
-                    decompressed_bytes.load(AtomicOrdering::Relaxed),
-                    compressed_bytes.load(AtomicOrdering::Relaxed),
-                    compressed_total,
-                );
                 reporter.record()?;
-                continue;
+            } else {
+                lines.push(next);
             }
-        };
-        stats.raw_parsed += 1;
-        match normalize_product_with_reason(&raw) {
-            Ok(product) => {
-                stats.accepted_products += 1;
-                products.push(product);
-                if products.len() >= chunk_size {
-                    let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
-                    write_run(&path, &mut products)?;
-                    runs.push(path);
-                    stats.sort_runs = runs.len() as u64;
+        }
+        let outcomes = pool.install(|| {
+            lines
+                .par_iter()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line.trim_end())
+                        .map_err(|_| None)
+                        .and_then(|raw| normalize_product_with_reason(&raw).map_err(Some))
+                })
+                .collect::<Vec<_>>()
+        });
+        for outcome in outcomes {
+            match outcome {
+                Ok(product) => {
+                    stats.raw_parsed += 1;
+                    stats.accepted_products += 1;
+                    products.push(product);
+                    if products.len() >= chunk_size {
+                        let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
+                        write_run(&path, &mut products, &pool)?;
+                        runs.push(path);
+                        stats.sort_runs = runs.len() as u64;
+                    }
+                }
+                Err(None) => stats.invalid_lines += 1,
+                Err(Some(reason)) => {
+                    stats.raw_parsed += 1;
+                    stats.skipped_products += 1;
+                    match reason {
+                        SkipReason::InvalidBarcode => stats.skipped_invalid_barcode += 1,
+                        SkipReason::MissingName => stats.skipped_missing_name += 1,
+                        SkipReason::MissingNutrition => stats.skipped_missing_nutrition += 1,
+                        SkipReason::Validation => stats.skipped_validation += 1,
+                    }
                 }
             }
-            Err(reason) => {
-                stats.skipped_products += 1;
-                match reason {
-                    SkipReason::InvalidBarcode => stats.skipped_invalid_barcode += 1,
-                    SkipReason::MissingName => stats.skipped_missing_name += 1,
-                    SkipReason::MissingNutrition => stats.skipped_missing_nutrition += 1,
-                    SkipReason::Validation => stats.skipped_validation += 1,
-                }
-            }
+            reporter.record()?;
         }
         reporter.publish_stats(
             &stats,
@@ -1192,11 +1222,10 @@ fn collect_runs(
             compressed_bytes.load(AtomicOrdering::Relaxed),
             compressed_total,
         );
-        reporter.record()?;
     }
     if !products.is_empty() {
         let path = temp.join(format!("run-{:08}.jsonl", runs.len()));
-        write_run(&path, &mut products)?;
+        write_run(&path, &mut products, &pool)?;
         runs.push(path);
     }
     stats.sort_runs = runs.len() as u64;
@@ -1213,6 +1242,8 @@ fn merge_runs(
     runs: &[PathBuf],
     index: &Index,
     fields: IndexFields,
+    worker_threads: usize,
+    index_memory_bytes: usize,
     reporter: &ProgressReporter,
 ) -> Result<(usize, String), PipelineError> {
     reporter.set_phase("merge")?;
@@ -1230,7 +1261,7 @@ fn merge_runs(
             });
         }
     }
-    let mut writer = index.writer(128_000_000)?;
+    let mut writer = index.writer_with_num_threads(worker_threads, index_memory_bytes)?;
     let mut count = 0;
     let mut normalized_hasher = Sha256::new();
     while let Some(item) = heap.pop() {
@@ -1384,6 +1415,14 @@ fn build_release_inner(
             "chunk size must be positive".into(),
         ));
     }
+    if options.worker_threads == 0
+        || options.index_memory_bytes < options.worker_threads * 15_000_000
+    {
+        return Err(PipelineError::InvalidRelease(
+            "worker threads must be positive and index memory must be at least 15 MB per worker"
+                .into(),
+        ));
+    }
     if !valid_dataset_version(&options.dataset_version) {
         return Err(PipelineError::InvalidRelease(
             "dataset version must be 1-64 ASCII letters, digits, '.', '_' or '-' and start with a letter/digit".into(),
@@ -1409,12 +1448,20 @@ fn build_release_inner(
         &options.input,
         temporary.path(),
         options.chunk_size,
+        options.worker_threads,
         reporter,
     )?;
     reporter.set_phase("external_sort")?;
     let (schema, fields) = build_schema();
     let index = Index::create_in_dir(options.output.join("index"), schema)?;
-    let (count, normalized_sha256) = merge_runs(&runs, &index, fields, reporter)?;
+    let (count, normalized_sha256) = merge_runs(
+        &runs,
+        &index,
+        fields,
+        options.worker_threads,
+        options.index_memory_bytes,
+        reporter,
+    )?;
     stats.record_count = count;
     reporter.set_indexed_docs(count)?;
     // These locks belong to the build process, not the read-mostly release.
@@ -1456,7 +1503,7 @@ fn build_release_inner(
     fs::write(options.output.join(MANIFEST_FILE), manifest_bytes)?;
     verify_release_with_progress(&options.output, reporter)?;
     if let Some(artifact) = &options.artifact {
-        package_release_with_progress(&options.output, artifact, reporter)?;
+        package_release_unchecked(&options.output, artifact, options.worker_threads, reporter)?;
     }
     Ok(manifest)
 }
@@ -1713,12 +1760,25 @@ pub fn package_release_with_progress(
     reporter: &ProgressReporter,
 ) -> Result<(), PipelineError> {
     verify_release_with_progress(root, reporter)?;
+    let worker_threads = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    package_release_unchecked(root, artifact, worker_threads, reporter)
+}
+
+fn package_release_unchecked(
+    root: &Path,
+    artifact: &Path,
+    worker_threads: usize,
+    reporter: &ProgressReporter,
+) -> Result<(), PipelineError> {
     reporter.set_phase("package")?;
     if let Some(parent) = artifact.parent() {
         fs::create_dir_all(parent)?;
     }
     let output = File::create(artifact)?;
     let mut encoder = zstd::stream::write::Encoder::new(output, 6)?;
+    encoder.multithread(worker_threads as u32)?;
     append_archive_tree(
         &mut encoder,
         &root.join("index"),
@@ -1858,6 +1918,8 @@ mod tests {
                 artifact: Some(artifact),
                 dataset_version: "fixture-progress".into(),
                 chunk_size: 1,
+                worker_threads: 2,
+                index_memory_bytes: 64 * 1024 * 1024,
             },
             &mut reporter,
         )

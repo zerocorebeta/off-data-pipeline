@@ -69,6 +69,16 @@ fn optional_chunk_size(args: &[String]) -> Result<usize, String> {
         .ok_or_else(|| "chunk size must be a positive integer".to_owned())
 }
 
+fn positive_usize(args: &[String], name: &str, default: usize) -> Result<usize, String> {
+    let Some(value) = optional_number(args, name)? else {
+        return Ok(default);
+    };
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer"))
+}
+
 fn progress_options(args: &[String]) -> Result<ProgressOptions, String> {
     let defaults = ProgressOptions::default();
     let record_interval = optional_number(args, "--progress-records")?
@@ -108,7 +118,7 @@ fn finish_progress<T>(
 }
 
 fn usage() -> &'static str {
-    "usage:\n  off-data-pipeline build --input DUMP.jsonl.gz --output RELEASE --dataset-version VERSION [--artifact ARCHIVE] [--chunk-size N] [--progress-records N] [--progress-interval-ms N|--progress-interval-seconds N]\n  off-data-pipeline verify --release RELEASE [progress flags]\n  off-data-pipeline package --release RELEASE --artifact ARCHIVE [progress flags]"
+    "usage:\n  off-data-pipeline build --input DUMP.jsonl.gz --output RELEASE --dataset-version VERSION [--artifact ARCHIVE] [--chunk-size N] [--worker-threads N] [--index-memory-mb N] [--progress-records N] [--progress-interval-ms N|--progress-interval-seconds N]\n  off-data-pipeline verify --release RELEASE [progress flags]\n  off-data-pipeline package --release RELEASE --artifact ARCHIVE [progress flags]"
 }
 
 fn run() -> Result<(), String> {
@@ -117,6 +127,11 @@ fn run() -> Result<(), String> {
     match command {
         "build" => {
             let chunk_size = optional_chunk_size(&args)?;
+            let default_threads = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1);
+            let worker_threads = positive_usize(&args, "--worker-threads", default_threads)?;
+            let index_memory_mb = positive_usize(&args, "--index-memory-mb", 512)?;
             let progress = progress_options(&args)?;
             let mut reporter =
                 ProgressReporter::new(progress).map_err(|error| error.to_string())?;
@@ -126,6 +141,10 @@ fn run() -> Result<(), String> {
                 artifact: optional_flag(&args, "--artifact")?,
                 dataset_version: required_text(&args, "--dataset-version")?,
                 chunk_size,
+                worker_threads,
+                index_memory_bytes: index_memory_mb
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| "--index-memory-mb is too large".to_owned())?,
             };
             let manifest = build_release_with_progress(&options, &mut reporter)
                 .map_err(|error| error.to_string())?;

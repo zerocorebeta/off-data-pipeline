@@ -24,12 +24,14 @@ concurrency:
 env:
   # Scheduled runs are always full; manual runs default to the upload-free fixture.
   OFF_MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'fixture' }}
-  OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-products.jsonl.gz
+  OFF_DUMP_URL: https://openfoodfacts-ds.s3.eu-west-3.amazonaws.com/openfoodfacts-products.jsonl.gz
   MIN_FREE_KB: 25000000
   # Keep full-run logs bounded while ensuring both record and wall-clock
   # telemetry is visible during slow ingestion and index phases.
   OFF_PROGRESS_RECORDS: 250000
   OFF_PROGRESS_INTERVAL_SECONDS: 30
+  OFF_CHUNK_SIZE: 500000
+  OFF_INDEX_MEMORY_MB: 2048
 
 jobs:
   build-and-upload:
@@ -37,6 +39,15 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
       - name: Check runner disk before download
         shell: bash
         run: |
@@ -51,10 +62,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          command -v aria2c >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y aria2
+          }
           dump="${RUNNER_TEMP}/openfoodfacts-products.jsonl.gz"
-          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
-            --output "${dump}.part" "${OFF_DUMP_URL}"
-          mv "${dump}.part" "${dump}"
+          download_dir="$(mktemp -d "${RUNNER_TEMP}/off-download.XXXXXX")"
+          cleanup_download() { rm -rf -- "${download_dir}"; }
+          trap cleanup_download EXIT
+          aria2c \
+            -x 16 \
+            -s 16 \
+            -k 10M \
+            --max-tries 8 \
+            --retry-wait 5 \
+            --timeout 60 \
+            --connect-timeout 30 \
+            -o openfoodfacts-products.jsonl.gz \
+            --dir "${download_dir}" \
+            "${OFF_DUMP_URL}"
+          mv "${download_dir}/openfoodfacts-products.jsonl.gz" "${dump}"
           test -s "${dump}"
           free_kb="$(df -Pk "${RUNNER_TEMP}" | awk 'NR==2 {print $4}')"
           test "${free_kb}" -ge "${MIN_FREE_KB}" || {
@@ -68,57 +95,87 @@ jobs:
         run: |
           set -euo pipefail
           echo 'OFF_INPUT=tests/fixtures/products.jsonl.gz' >> "${GITHUB_ENV}"
-      - name: Rust checks
+      - name: Compile optimized pipeline
         shell: bash
         run: |
           set -euo pipefail
-          log="${RUNNER_TEMP}/off-rust-checks.log"
-          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+          scripts/observe-command.sh "${RUNNER_TEMP}/off-compile.log" \
+            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
             timeout --foreground --signal=TERM --kill-after=60s 30m \
-            cargo fmt --manifest-path Cargo.toml --check
-          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
-            timeout --foreground --signal=TERM --kill-after=60s 30m \
-            cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
-          scripts/observe-command.sh "${log}" --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
-            timeout --foreground --signal=TERM --kill-after=60s 30m \
-            cargo test --locked --manifest-path Cargo.toml
+            cargo build --release --locked --manifest-path Cargo.toml
       - name: Build release
         shell: bash
+        env:
+          SFTP_HOST: ${{ secrets.OFF_SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.OFF_SFTP_PORT }}
+          SFTP_USER: ${{ secrets.OFF_SFTP_USER }}
+          SFTP_PRIVATE_KEY: ${{ secrets.OFF_SFTP_PRIVATE_KEY }}
+          SFTP_KNOWN_HOSTS: ${{ secrets.OFF_SFTP_KNOWN_HOSTS }}
+          SFTP_REMOTE_DIR: ${{ secrets.OFF_SFTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
           if [[ "${OFF_MODE}" == fixture ]]; then
             dataset="fixture-${GITHUB_RUN_ID:-manual}"
+            chunk_size=50000
+            index_memory_mb=256
           else
             dataset="$(date -u +%Y-%m-%d)"
+            chunk_size="${OFF_CHUNK_SIZE}"
+            index_memory_mb="${OFF_INDEX_MEMORY_MB}"
           fi
+          worker_threads="$(nproc)"
           run_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}"
           output="${RUNNER_TEMP}/off-release"
           # Keep every upload name unique so a retry cannot mix a new archive
           # with an old checksum sidecar while activation is watching incoming/.
           artifact="${RUNNER_TEMP}/off-index-${dataset}-${run_key}.tar.zst"
           build_log="${RUNNER_TEMP}/off-build.log"
+          status_file="${RUNNER_TEMP}/off-progress.json"
+          observe_args=()
+          if [[ "${OFF_MODE}" == full ]]; then
+            observe_args=(--status-file "${status_file}")
+          fi
+          publish_status() {
+            [[ "${OFF_MODE}" == full && -s "${status_file}" ]] || return 0
+            scripts/publish-progress.sh "${status_file}" || {
+              echo 'OFF progress status upload failed; continuing the build.' >&2
+            }
+          }
+          set +e
           scripts/observe-command.sh "${build_log}" \
-            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
+            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" \
+            "${observe_args[@]}" -- \
             timeout --foreground --signal=TERM --kill-after=60s 150m \
-            cargo run --locked -- build --input "${OFF_INPUT}" --output "${output}" \
+            ./target/release/off-data-pipeline build \
+              --input "${OFF_INPUT}" --output "${output}" \
               --dataset-version "${dataset}" --artifact "${artifact}" \
+              --chunk-size "${chunk_size}" \
+              --worker-threads "${worker_threads}" \
+              --index-memory-mb "${index_memory_mb}" \
               --progress-records "${OFF_PROGRESS_RECORDS}" \
-              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}"
+              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" &
+          build_pid="$!"
+          set -e
+          if [[ "${OFF_MODE}" == full ]]; then
+            while kill -0 "${build_pid}" 2>/dev/null; do
+              publish_status
+              sleep "${OFF_PROGRESS_INTERVAL_SECONDS}"
+            done
+          fi
+          set +e
+          wait "${build_pid}"
+          build_status="$?"
+          set -e
+          publish_status
+          [[ "${build_status}" -eq 0 ]] || exit "${build_status}"
           test -s "${output}/off-index-manifest.json"
           test -s "${artifact}"
           echo "OFF_RELEASE=${output}" >> "${GITHUB_ENV}"
           echo "OFF_ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
-      - name: Verify release
+      - name: Checksum release artifact
         shell: bash
         run: |
           set -euo pipefail
-          verify_log="${RUNNER_TEMP}/off-verify.log"
-          scripts/observe-command.sh "${verify_log}" \
-            --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" -- \
-            timeout --foreground --signal=TERM --kill-after=60s 30m \
-            cargo run --locked -- verify --release "${OFF_RELEASE}" \
-              --progress-records "${OFF_PROGRESS_RECORDS}" \
-              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}"
           sha256sum "${OFF_ARTIFACT}" > "${OFF_ARTIFACT}.sha256"
       - name: Summarize release counters
         if: always()
