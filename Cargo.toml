@@ -1,0 +1,31 @@
+[package]
+name = "off-data-pipeline"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Bounded-memory Open Food Facts JSONL stream normalizer and Tantivy packager"
+
+[lib]
+name = "off_data_pipeline"
+path = "src/lib.rs"
+
+[[bin]]
+name = "off-data-pipeline"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.0.35"
+miniz_oxide = "=0.8.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tantivy = "0.22.1"
+thiserror = "2.0.19"
+tempfile = "3.27.0"
+zstd = "0.13.3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

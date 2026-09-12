@@ -1,0 +1,131 @@
+name: Open Food Facts release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Validation mode (fixture is upload-free; full downloads and uploads the OFF dump)'
+        required: true
+        default: fixture
+        type: choice
+        options:
+          - fixture
+          - full
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: off-data-refresh
+  cancel-in-progress: false
+
+env:
+  # Scheduled runs are always full; manual runs default to the upload-free fixture.
+  OFF_MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'fixture' }}
+  OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-products.jsonl.gz
+  MIN_FREE_KB: 25000000
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check runner disk before download
+        shell: bash
+        run: |
+          set -euo pipefail
+          free_kb="$(df -Pk "${RUNNER_TEMP}" | awk 'NR==2 {print $4}')"
+          test "${free_kb}" -ge "${MIN_FREE_KB}" || {
+            echo "Not enough free runner disk: ${free_kb} KB" >&2
+            exit 1
+          }
+      - name: Download compressed official dump
+        if: env.OFF_MODE == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dump="${RUNNER_TEMP}/openfoodfacts-products.jsonl.gz"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --output "${dump}.part" "${OFF_DUMP_URL}"
+          mv "${dump}.part" "${dump}"
+          test -s "${dump}"
+          free_kb="$(df -Pk "${RUNNER_TEMP}" | awk 'NR==2 {print $4}')"
+          test "${free_kb}" -ge "${MIN_FREE_KB}" || {
+            echo "Download left too little free disk: ${free_kb} KB" >&2
+            exit 1
+          }
+          echo "OFF_INPUT=${dump}" >> "${GITHUB_ENV}"
+      - name: Use checked-in fixture
+        if: env.OFF_MODE == 'fixture'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'OFF_INPUT=tests/fixtures/products.jsonl.gz' >> "${GITHUB_ENV}"
+      - name: Rust checks
+        run: |
+          cargo fmt --manifest-path Cargo.toml --check
+          cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path Cargo.toml
+        working-directory: off-data-pipeline
+      - name: Build and verify release
+        shell: bash
+        working-directory: off-data-pipeline
+        run: |
+          set -euo pipefail
+          if [[ "${OFF_MODE}" == fixture ]]; then
+            dataset="fixture-${GITHUB_RUN_ID:-manual}"
+          else
+            dataset="$(date -u +%Y-%m-%d)"
+          fi
+          run_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}"
+          output="${RUNNER_TEMP}/off-release"
+          # Keep every upload name unique so a retry cannot mix a new archive
+          # with an old checksum sidecar while activation is watching incoming/.
+          artifact="${RUNNER_TEMP}/off-index-${dataset}-${run_key}.tar.zst"
+          cargo run --locked -- build --input "${OFF_INPUT}" --output "${output}" \
+            --dataset-version "${dataset}" --artifact "${artifact}"
+          cargo run --locked -- verify --release "${output}"
+          sha256sum "${artifact}" > "${artifact}.sha256"
+          echo "OFF_ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
+      - name: Upload over restricted SFTP
+        if: env.OFF_MODE == 'full'
+        shell: bash
+        env:
+          SFTP_HOST: ${{ secrets.OFF_SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.OFF_SFTP_PORT }}
+          SFTP_USER: ${{ secrets.OFF_SFTP_USER }}
+          SFTP_PRIVATE_KEY: ${{ secrets.OFF_SFTP_PRIVATE_KEY }}
+          SFTP_KNOWN_HOSTS: ${{ secrets.OFF_SFTP_KNOWN_HOSTS }}
+          SFTP_REMOTE_DIR: ${{ secrets.OFF_SFTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          test -n "${SFTP_HOST}" -a -n "${SFTP_USER}" -a -n "${SFTP_PRIVATE_KEY}" \
+            -a -n "${SFTP_KNOWN_HOSTS}" -a -n "${SFTP_REMOTE_DIR}"
+          test "${SFTP_REMOTE_DIR}" = /incoming || {
+            echo 'SFTP_REMOTE_DIR must be /incoming inside the OFF chroot.' >&2
+            exit 1
+          }
+          key="${RUNNER_TEMP}/off-sftp-key"
+          known_hosts="${RUNNER_TEMP}/off-known-hosts"
+          cleanup_sftp() { rm -f -- "${key}" "${known_hosts}"; }
+          trap cleanup_sftp EXIT
+          umask 077
+          printf '%s\n' "${SFTP_PRIVATE_KEY}" > "${key}"
+          printf '%s\n' "${SFTP_KNOWN_HOSTS}" > "${known_hosts}"
+          artifact_name="$(basename "${OFF_ARTIFACT}")"
+          port_args=()
+          [[ -n "${SFTP_PORT:-}" ]] && port_args=(-P "${SFTP_PORT}")
+          upload_suffix=".part-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}"
+          sftp -i "${key}" -oIdentitiesOnly=yes -oBatchMode=yes -oStrictHostKeyChecking=yes \
+            -oUserKnownHostsFile="${known_hosts}" "${port_args[@]}" "${SFTP_USER}@${SFTP_HOST}" <<SFTP
+          cd ${SFTP_REMOTE_DIR}
+          put ${OFF_ARTIFACT} ${artifact_name}${upload_suffix}
+          put ${OFF_ARTIFACT}.sha256 ${artifact_name}.sha256${upload_suffix}
+          rename ${artifact_name}${upload_suffix} ${artifact_name}
+          rename ${artifact_name}.sha256${upload_suffix} ${artifact_name}.sha256
+          SFTP
+          cleanup_sftp
+          trap - EXIT
