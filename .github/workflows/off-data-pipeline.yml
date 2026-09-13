@@ -15,6 +15,10 @@ on:
         description: 'Optional deterministic dataset version for an operator-triggered full release'
         required: false
         type: string
+      trace_barcode:
+        description: 'Optional barcode to trace through bulk-dump ingestion'
+        required: false
+        type: string
   schedule:
     - cron: '17 3 * * 1'
 
@@ -37,6 +41,7 @@ env:
   OFF_CHUNK_SIZE: 500000
   OFF_INDEX_MEMORY_MB: 2048
   OFF_WORKER_THREADS: 6
+  OFF_TRACE_BARCODE: ${{ inputs.trace_barcode || '' }}
 
 jobs:
   build-and-upload:
@@ -110,13 +115,6 @@ jobs:
             cargo build --release --locked --manifest-path Cargo.toml
       - name: Build release
         shell: bash
-        env:
-          SFTP_HOST: ${{ secrets.OFF_SFTP_HOST }}
-          SFTP_PORT: ${{ secrets.OFF_SFTP_PORT }}
-          SFTP_USER: ${{ secrets.OFF_SFTP_USER }}
-          SFTP_PRIVATE_KEY: ${{ secrets.OFF_SFTP_PRIVATE_KEY }}
-          SFTP_KNOWN_HOSTS: ${{ secrets.OFF_SFTP_KNOWN_HOSTS }}
-          SFTP_REMOTE_DIR: ${{ secrets.OFF_SFTP_REMOTE_DIR }}
         run: |
           set -euo pipefail
           if [[ "${OFF_MODE}" == fixture ]]; then
@@ -135,35 +133,10 @@ jobs:
           # with an old checksum sidecar while activation is watching incoming/.
           artifact="${RUNNER_TEMP}/off-index-${dataset}-${run_key}.tar.zst"
           build_log="${RUNNER_TEMP}/off-build.log"
-          status_file="${RUNNER_TEMP}/off-progress.json"
-          observe_args=()
-          if [[ "${OFF_MODE}" == full ]]; then
-            observe_args=(--status-file "${status_file}")
-          fi
-          publish_status() {
-            [[ "${OFF_MODE}" == full && -s "${status_file}" ]] || return 0
-            scripts/publish-progress.sh "${status_file}" "$@" || {
-              echo 'OFF progress status upload failed; continuing the build.' >&2
-            }
-          }
-          terminal_status() {
-            local code="$?" state=cancelled
-            if [[ "$code" == 0 ]]; then
-              state=success
-            elif [[ "$code" != 130 && "$code" != 143 ]]; then
-              state=failure
-            fi
-            publish_status --state "$state" --exit-code "$code"
-            return "$code"
-          }
-          # EXIT publishes the last complete status; TERM/INT become a
-          # cancellation state before EXIT runs. Publishing is best effort.
-          trap terminal_status EXIT
-          trap 'exit 143' TERM INT
           set +e
           scripts/observe-command.sh "${build_log}" \
             --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" \
-            "${observe_args[@]}" -- \
+            -- \
             timeout --foreground --signal=TERM --kill-after=60s 150m \
             ./target/release/off-data-pipeline build \
               --input "${OFF_INPUT}" --output "${output}" \
@@ -172,17 +145,7 @@ jobs:
               --worker-threads "${OFF_WORKER_THREADS}" \
               --index-memory-mb "${index_memory_mb}" \
               --progress-records "${OFF_PROGRESS_RECORDS}" \
-              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" &
-          build_pid="$!"
-          set -e
-          if [[ "${OFF_MODE}" == full ]]; then
-            while kill -0 "${build_pid}" 2>/dev/null; do
-              publish_status
-              sleep "${OFF_PROGRESS_INTERVAL_SECONDS}"
-            done
-          fi
-          set +e
-          wait "${build_pid}"
+              --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}"
           build_status="$?"
           set -e
           [[ "${build_status}" -eq 0 ]] || exit "${build_status}"
@@ -190,7 +153,6 @@ jobs:
           test -s "${artifact}"
           echo "OFF_RELEASE=${output}" >> "${GITHUB_ENV}"
           echo "OFF_ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
-          trap - EXIT TERM INT
       - name: Checksum release artifact
         shell: bash
         run: |

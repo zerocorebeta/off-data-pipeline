@@ -849,6 +849,43 @@ fn normalized_number(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
+fn aggregated_nutrient(raw: &Value, name: &str) -> Option<(f64, String)> {
+    let set = raw.get("nutrition")?.get("aggregated_set")?;
+    if set.get("per")?.as_str()? != "100g" {
+        return None;
+    }
+    let nutrient = set.get("nutrients")?.get(name)?;
+    let value = non_negative_number(nutrient, &["value", "value_computed"])?;
+    let unit = nutrient
+        .get("unit")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Some((value, unit))
+}
+
+fn aggregated_grams(raw: &Value, name: &str) -> Option<f64> {
+    let (value, unit) = aggregated_nutrient(raw, name)?;
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "g" => Some(value),
+        "mg" => Some(value / 1_000.0),
+        "µg" | "μg" | "ug" => Some(value / 1_000_000.0),
+        "kg" => Some(value * 1_000.0),
+        _ => None,
+    }
+}
+
+fn aggregated_energy_kcal(raw: &Value) -> Option<f64> {
+    if let Some((value, unit)) = aggregated_nutrient(raw, "energy-kcal")
+        && (unit.is_empty() || unit.eq_ignore_ascii_case("kcal"))
+    {
+        return Some(value);
+    }
+    let (value, unit) =
+        aggregated_nutrient(raw, "energy-kj").or_else(|| aggregated_nutrient(raw, "energy"))?;
+    unit.eq_ignore_ascii_case("kj").then_some(value / 4.184)
+}
+
 fn country_values(value: &Value) -> Vec<String> {
     list_value(value, &["countries_tags", "countries"])
         .into_iter()
@@ -913,27 +950,32 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
             &["energy-kj_prepared_100g", "energy-kj_prepared"],
         )
         .map(|value| value / 4.184)
-    });
+    })
+    .or_else(|| aggregated_energy_kcal(raw));
     let protein_100g =
-        non_negative_number(nutriments, &["proteins_100g", "protein_100g", "proteins"]).or_else(
-            || {
+        non_negative_number(nutriments, &["proteins_100g", "protein_100g", "proteins"])
+            .or_else(|| {
                 non_negative_number(
                     nutriments,
                     &["proteins_prepared_100g", "protein_prepared_100g"],
                 )
-            },
-        );
+            })
+            .or_else(|| aggregated_grams(raw, "proteins"));
     let carbohydrates_100g = non_negative_number(
         nutriments,
         &["carbohydrates_100g", "carbohydrates_value", "carbohydrates"],
     )
-    .or_else(|| non_negative_number(nutriments, &["carbohydrates_prepared_100g"]));
+    .or_else(|| non_negative_number(nutriments, &["carbohydrates_prepared_100g"]))
+    .or_else(|| aggregated_grams(raw, "carbohydrates"));
     let fat_100g = non_negative_number(nutriments, &["fat_100g", "fat_value", "fat"])
-        .or_else(|| non_negative_number(nutriments, &["fat_prepared_100g"]));
+        .or_else(|| non_negative_number(nutriments, &["fat_prepared_100g"]))
+        .or_else(|| aggregated_grams(raw, "fat"));
     let fiber_100g = non_negative_number(nutriments, &["fiber_100g", "fiber"])
-        .or_else(|| non_negative_number(nutriments, &["fiber_prepared_100g"]));
+        .or_else(|| non_negative_number(nutriments, &["fiber_prepared_100g"]))
+        .or_else(|| aggregated_grams(raw, "fiber"));
     let sugars_100g = non_negative_number(nutriments, &["sugars_100g", "sugars"])
-        .or_else(|| non_negative_number(nutriments, &["sugars_prepared_100g"]));
+        .or_else(|| non_negative_number(nutriments, &["sugars_prepared_100g"]))
+        .or_else(|| aggregated_grams(raw, "sugars"));
     let saturated_fat_100g = non_negative_number(
         nutriments,
         &["saturated-fat_100g", "saturated_fat_100g", "saturated-fat"],
@@ -943,9 +985,11 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
             nutriments,
             &["saturated-fat_prepared_100g", "saturated_fat_prepared_100g"],
         )
-    });
+    })
+    .or_else(|| aggregated_grams(raw, "saturated-fat"));
     let salt_100g = non_negative_number(nutriments, &["salt_100g", "salt"])
-        .or_else(|| non_negative_number(nutriments, &["salt_prepared_100g"]));
+        .or_else(|| non_negative_number(nutriments, &["salt_prepared_100g"]))
+        .or_else(|| aggregated_grams(raw, "salt"));
     if [
         energy_kcal_100g,
         protein_100g,
@@ -1179,6 +1223,11 @@ fn collect_runs(
     let mut products = Vec::with_capacity(chunk_size);
     let mut runs = Vec::new();
     let mut stats = BuildStats::default();
+    let trace_barcode = std::env::var("OFF_TRACE_BARCODE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut trace_seen = false;
     let mut line = String::new();
     let batch_size = worker_threads.saturating_mul(256).max(256);
     reporter.publish_stats(&stats, 0, 0, compressed_total);
@@ -1218,13 +1267,31 @@ fn collect_runs(
             lines
                 .par_iter()
                 .map(|line| {
-                    serde_json::from_str::<Value>(line.trim_end())
-                        .map_err(|_| None)
-                        .and_then(|raw| normalize_product_with_reason(&raw).map_err(Some))
+                    let raw = serde_json::from_str::<Value>(line.trim_end()).map_err(|_| None);
+                    match raw {
+                        Ok(raw) => {
+                            let barcode = string_value(&raw, &["code", "barcode", "_id"]);
+                            (barcode, normalize_product_with_reason(&raw).map_err(Some))
+                        }
+                        Err(error) => (String::new(), Err(error)),
+                    }
                 })
                 .collect::<Vec<_>>()
         });
-        for outcome in outcomes {
+        for (candidate_barcode, outcome) in outcomes {
+            let tracing = trace_barcode.as_deref() == Some(candidate_barcode.as_str());
+            if tracing {
+                trace_seen = true;
+                let result = match &outcome {
+                    Ok(_) => "accepted",
+                    Err(None) => "invalid_json",
+                    Err(Some(SkipReason::InvalidBarcode)) => "skipped_invalid_barcode",
+                    Err(Some(SkipReason::MissingName)) => "skipped_missing_name",
+                    Err(Some(SkipReason::MissingNutrition)) => "skipped_missing_nutrition",
+                    Err(Some(SkipReason::Validation)) => "skipped_validation",
+                };
+                eprintln!("OFF_TRACE barcode={candidate_barcode} ingest={result}");
+            }
             match outcome {
                 Ok(product) => {
                     stats.raw_parsed += 1;
@@ -1264,6 +1331,11 @@ fn collect_runs(
         runs.push(path);
     }
     stats.sort_runs = runs.len() as u64;
+    if let Some(barcode) = trace_barcode
+        && !trace_seen
+    {
+        eprintln!("OFF_TRACE barcode={barcode} ingest=absent_from_dump");
+    }
     reporter.publish_stats(
         &stats,
         decompressed_bytes.load(AtomicOrdering::Relaxed),
@@ -1899,6 +1971,35 @@ mod tests {
         });
 
         let product = normalize_product(&value).expect("prepared product");
+        assert_eq!(product.barcode, "8906007283120");
+        assert_eq!(product.energy_kcal_100g, Some(343.0));
+        assert_eq!(product.protein_100g, Some(52.5));
+        assert_eq!(product.carbohydrates_100g, Some(31.5));
+        assert_eq!(product.fat_100g, Some(1.0));
+        assert_eq!(product.salt_100g, Some(0.27));
+    }
+
+    #[test]
+    fn accepts_current_raw_aggregated_nutrition_schema() {
+        let value = serde_json::json!({
+            "code": "8906007283120",
+            "product_name": "Fortune Soya Chunks",
+            "nutrition": {
+                "aggregated_set": {
+                    "per": "100g",
+                    "preparation": "prepared",
+                    "nutrients": {
+                        "energy-kcal": {"unit": "kcal", "value": 343},
+                        "proteins": {"unit": "g", "value": 52.5},
+                        "carbohydrates": {"unit": "g", "value": 31.5},
+                        "fat": {"unit": "g", "value": 1},
+                        "salt": {"unit": "mg", "value": 270}
+                    }
+                }
+            }
+        });
+
+        let product = normalize_product(&value).expect("current raw product");
         assert_eq!(product.barcode, "8906007283120");
         assert_eq!(product.energy_kcal_100g, Some(343.0));
         assert_eq!(product.protein_100g, Some(52.5));

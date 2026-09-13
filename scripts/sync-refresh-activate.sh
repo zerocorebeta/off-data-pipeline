@@ -47,7 +47,7 @@ head_sha="$(git -C "$workdir/repo" rev-parse HEAD)"
 dataset="$(date -u +%Y-%m-%d-%H%M%S)"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
-  -f mode=full -f dataset_version="$dataset"
+  -f mode=full -f dataset_version="$dataset" -f trace_barcode="$VERIFY_BARCODE"
 
 run_id=''
 for _ in $(seq 1 30); do
