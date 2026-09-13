@@ -886,6 +886,33 @@ fn aggregated_energy_kcal(raw: &Value) -> Option<f64> {
     unit.eq_ignore_ascii_case("kj").then_some(value / 4.184)
 }
 
+fn rejection_shape(raw: &Value) -> String {
+    let legacy = raw
+        .get("nutriments")
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let aggregate = raw
+        .get("nutrition")
+        .and_then(|value| value.get("aggregated_set"));
+    let aggregate_per = aggregate
+        .and_then(|value| value.get("per"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let aggregate_nutrients = aggregate
+        .and_then(|value| value.get("nutrients"))
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let localized_names = raw.as_object().map_or(0, |object| {
+        object
+            .keys()
+            .filter(|key| key.starts_with("product_name_"))
+            .count()
+    });
+    format!(
+        "legacy_nutrients={legacy} aggregate_per={aggregate_per} aggregate_nutrients={aggregate_nutrients} localized_names={localized_names}"
+    )
+}
+
 fn country_values(value: &Value) -> Vec<String> {
     list_value(value, &["countries_tags", "countries"])
         .into_iter()
@@ -1216,10 +1243,11 @@ fn collect_runs(
     let compressed_total = fs::metadata(input)?.len();
     let compressed_bytes = Arc::new(AtomicU64::new(0));
     let decompressed_bytes = Arc::new(AtomicU64::new(0));
+    const IO_BUFFER_BYTES: usize = 4 * 1024 * 1024;
     let input_file = CountingReader::new(File::open(input)?, Arc::clone(&compressed_bytes));
-    let decoder = MultiGzDecoder::new(BufReader::new(input_file));
+    let decoder = MultiGzDecoder::new(BufReader::with_capacity(IO_BUFFER_BYTES, input_file));
     let counted_decoder = CountingReader::new(decoder, Arc::clone(&decompressed_bytes));
-    let mut reader = BufReader::new(counted_decoder);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, counted_decoder);
     let mut products = Vec::with_capacity(chunk_size);
     let mut runs = Vec::new();
     let mut stats = BuildStats::default();
@@ -1228,6 +1256,7 @@ fn collect_runs(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let mut trace_seen = false;
+    let mut rejection_samples = [0_u8; 4];
     let mut line = String::new();
     let batch_size = worker_threads.saturating_mul(256).max(256);
     reporter.publish_stats(&stats, 0, 0, compressed_total);
@@ -1271,14 +1300,19 @@ fn collect_runs(
                     match raw {
                         Ok(raw) => {
                             let barcode = string_value(&raw, &["code", "barcode", "_id"]);
-                            (barcode, normalize_product_with_reason(&raw).map_err(Some))
+                            let shape = rejection_shape(&raw);
+                            (
+                                barcode,
+                                normalize_product_with_reason(&raw).map_err(Some),
+                                shape,
+                            )
                         }
-                        Err(error) => (String::new(), Err(error)),
+                        Err(error) => (String::new(), Err(error), String::new()),
                     }
                 })
                 .collect::<Vec<_>>()
         });
-        for (candidate_barcode, outcome) in outcomes {
+        for (candidate_barcode, outcome, shape) in outcomes {
             let tracing = trace_barcode.as_deref() == Some(candidate_barcode.as_str());
             if tracing {
                 trace_seen = true;
@@ -1291,6 +1325,20 @@ fn collect_runs(
                     Err(Some(SkipReason::Validation)) => "skipped_validation",
                 };
                 eprintln!("OFF_TRACE barcode={candidate_barcode} ingest={result}");
+            }
+            if let Err(Some(reason)) = &outcome {
+                let (index, name) = match reason {
+                    SkipReason::InvalidBarcode => (0, "invalid_barcode"),
+                    SkipReason::MissingName => (1, "missing_name"),
+                    SkipReason::MissingNutrition => (2, "missing_nutrition"),
+                    SkipReason::Validation => (3, "validation"),
+                };
+                if rejection_samples[index] < 10 {
+                    rejection_samples[index] += 1;
+                    eprintln!(
+                        "OFF_REJECTION_SAMPLE reason={name} barcode={candidate_barcode} {shape}"
+                    );
+                }
             }
             match outcome {
                 Ok(product) => {
