@@ -54,6 +54,10 @@ remote_dir="${SFTP_REMOTE_DIR:-}"
 : "${SFTP_PRIVATE_KEY:?SFTP_PRIVATE_KEY is required}"
 : "${SFTP_KNOWN_HOSTS:?SFTP_KNOWN_HOSTS is required}"
 : "${remote_dir:?SFTP_REMOTE_DIR is required}"
+[[ "$status_file" != *$'\n'* && "$status_file" != *'"'* ]] || {
+  echo 'status path contains unsafe characters.' >&2
+  exit 2
+}
 [[ "$remote_dir" == /incoming ]] || {
   echo 'SFTP_REMOTE_DIR must be /incoming inside the OFF chroot.' >&2
   exit 2

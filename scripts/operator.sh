@@ -10,6 +10,7 @@ WORKFLOW="${PIPELINE_DIR}/.github/workflows/off-data-pipeline.yml"
 ROLLBACK_SCRIPT="${REPO_ROOT}/search-service/deploy/rollback-off-index.sh"
 ACTIVATE_SCRIPT="${REPO_ROOT}/search-service/deploy/activate-off-index.sh"
 SFTP_SCRIPT="${REPO_ROOT}/search-service/deploy/setup-off-sftp.sh"
+READ_PROGRESS_SCRIPT="${REPO_ROOT}/search-service/deploy/read-off-progress.sh"
 
 usage() {
   cat <<USAGE
@@ -19,12 +20,19 @@ usage:
   $0 prepare EXPORT_DIR
   $0 publish OWNER/REPO EXPORT_DIR --confirm-public
   $0 configure-secrets OWNER/REPO
+  $0 refresh OWNER/REPO
+  $0 progress SSH_TARGET [--run-id ID --run-attempt N] [--max-age-seconds N]
 
 prepare copies only the standalone off-data-pipeline tree into a fresh directory,
 excluding VCS/build/dump output, and scans it for credentials. publish creates a
 new public repository from that fresh directory; it refuses an existing repo.
 configure-secrets reads values from environment variables and key files; it
 never accepts credentials as command-line arguments or stores them locally.
+progress invokes the installed root-only reader over an existing SSH/admin path;
+it never uses the write-only SFTP account or the public HTTP service.
+refresh dispatches the full GitHub Actions workflow, which downloads, builds,
+verifies, packages, checksums, and uploads a new OFF index. It does not activate
+the uploaded index on production.
 USAGE
 }
 
@@ -71,14 +79,16 @@ prepare_export() {
 
 check_local_tools() {
   local command
-  for command in bash cargo cp find grep git mktemp xargs; do need_command "$command"; done
+  for command in bash cargo cp find grep git jq mktemp xargs; do need_command "$command"; done
   [[ -f "$WORKFLOW" ]] || fail "missing workflow: $WORKFLOW"
   [[ -x "$ACTIVATE_SCRIPT" ]] || fail "missing executable: $ACTIVATE_SCRIPT"
   [[ -x "$SFTP_SCRIPT" ]] || fail "missing executable: $SFTP_SCRIPT"
   [[ -x "$ROLLBACK_SCRIPT" ]] || fail "missing executable: $ROLLBACK_SCRIPT"
   [[ -x "$SCRIPT_DIR/observe-command.sh" ]] || fail "missing executable: $SCRIPT_DIR/observe-command.sh"
   [[ -x "$SCRIPT_DIR/publish-progress.sh" ]] || fail "missing executable: $SCRIPT_DIR/publish-progress.sh"
-  bash -n "$SCRIPT_DIR/operator.sh" "$SCRIPT_DIR/observe-command.sh" "$SCRIPT_DIR/publish-progress.sh" "$ACTIVATE_SCRIPT" "$SFTP_SCRIPT" "$ROLLBACK_SCRIPT"
+  [[ -x "$READ_PROGRESS_SCRIPT" ]] || fail "missing executable: $READ_PROGRESS_SCRIPT"
+  [[ -x "$SCRIPT_DIR/progress-test.sh" ]] || fail "missing executable: $SCRIPT_DIR/progress-test.sh"
+  bash -n "$SCRIPT_DIR/operator.sh" "$SCRIPT_DIR/observe-command.sh" "$SCRIPT_DIR/publish-progress.sh" "$ACTIVATE_SCRIPT" "$SFTP_SCRIPT" "$ROLLBACK_SCRIPT" "$READ_PROGRESS_SCRIPT" "$SCRIPT_DIR/progress-test.sh"
 }
 
 run_fixture() {
@@ -93,6 +103,7 @@ run_fixture() {
     --output "$temp/release" --dataset-version fixture-local \
     --artifact "$temp/off-index.tar.zst"
   cargo run --locked --manifest-path "$PIPELINE_DIR/Cargo.toml" -- verify --release "$temp/release"
+  "$SCRIPT_DIR/progress-test.sh"
   echo 'fixture validation passed; no network or upload was performed.'
 }
 
@@ -108,6 +119,35 @@ preflight() {
   export_dir="$(prepare_export "$temp")"
   rm -rf -- "$export_dir"
   echo 'preflight passed; external repository, secrets, SFTP, and production remain unchanged.'
+}
+
+
+read_progress() {
+  local target="${1:-}" run_id="" run_attempt="" max_age=""
+  shift || true
+  [[ "$target" =~ ^[A-Za-z0-9_.:-]+@[A-Za-z0-9_.:-]+$ || "$target" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
+    fail 'SSH_TARGET must be a host or user@host without shell metacharacters'
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ "${2:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || fail 'run id is unsafe'
+        run_id="$2"; shift 2 ;;
+      --run-attempt)
+        [[ "${2:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || fail 'run attempt is unsafe'
+        run_attempt="$2"; shift 2 ;;
+      --max-age-seconds)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || fail 'max age must be numeric'
+        max_age="$2"; shift 2 ;;
+      *) fail "unknown progress option: $1" ;;
+    esac
+  done
+  [[ ( -z "$run_id" && -z "$run_attempt" ) || ( -n "$run_id" && -n "$run_attempt" ) ]] || fail '--run-id and --run-attempt must be supplied together'
+  need_command ssh
+  local remote_args=(/usr/local/sbin/macrocodex-food-search-service-read-off-progress)
+  [[ -n "$run_id" ]] && remote_args+=(--run-id "$run_id" --run-attempt "$run_attempt")
+  [[ -n "$max_age" ]] && remote_args+=(--max-age-seconds "$max_age")
+  # All option values are constrained above; ssh receives a fixed root command.
+  ssh -- "$target" sudo -n -- "${remote_args[@]}"
 }
 
 configure_secrets() {
@@ -138,6 +178,15 @@ configure_secrets() {
   echo "configured OFF Actions secrets for $repo (secret values were not printed)."
 }
 
+refresh_index() {
+  local repo="$1"
+  validate_repo "$repo"
+  need_command gh
+  gh auth status
+  gh workflow run off-data-pipeline.yml --repo "$repo" -f mode=full
+  echo "full OFF index refresh dispatched for $repo; activation remains a separate checkpoint."
+}
+
 publish_repo() {
   local repo="$1" export_dir="$2"
   validate_repo "$repo"
@@ -165,6 +214,8 @@ case "$command" in
   prepare) [[ "$#" == 2 ]] || fail 'prepare requires EXPORT_DIR'; check_local_tools; prepare_export "$2" ;;
   publish) [[ "$#" == 4 ]] || fail 'publish requires OWNER/REPO EXPORT_DIR --confirm-public'; publish_repo "$2" "$3" "$4" ;;
   configure-secrets) [[ "$#" == 2 ]] || fail 'configure-secrets requires OWNER/REPO'; configure_secrets "$2" ;;
+  refresh) [[ "$#" == 2 ]] || fail 'refresh requires OWNER/REPO'; refresh_index "$2" ;;
+  progress) [[ "$#" -ge 2 ]] || fail 'progress requires SSH_TARGET'; read_progress "$2" "${@:3}" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

@@ -161,13 +161,13 @@ processes_json() {
     | awk 'NF >= 8 { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1,$2,$3,$4,$5,$6,$7,$8 }' \
     | jq -Rsc '
         split("\n") | map(select(length > 0) | split("\t") | {
-          pid: (.[0] | tonumber?),
-          ppid: (.[1] | tonumber?),
+          pid: (.[0] | try tonumber catch null),
+          ppid: (.[1] | try tonumber catch null),
           state: .[2],
           elapsed: .[3],
-          cpuPercent: (.[4] | tonumber?),
-          memoryPercent: (.[5] | tonumber?),
-          rssKb: (.[6] | tonumber?),
+          cpuPercent: (.[4] | try tonumber catch null),
+          memoryPercent: (.[5] | try tonumber catch null),
+          rssKb: (.[6] | try tonumber catch null),
           command: .[7]
         })
       '
@@ -188,8 +188,16 @@ runner_metrics() {
     fi
     loadavg="$(awk '{print $1","$2","$3}' /proc/loadavg 2>/dev/null || uptime)"
     cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
-    cpu_percent="$(ps -A -o pcpu= 2>/dev/null | awk '{sum += $1} END {printf "%.2f", sum + 0}' || echo unknown)"
-    process_list="$(processes_json || printf '[]')"
+    if cpu_percent="$(ps -A -o pcpu= 2>/dev/null | awk '{sum += $1} END {printf "%.2f", sum + 0}')"; then
+      :
+    else
+      cpu_percent=unknown
+    fi
+    if process_list="$(processes_json)"; then
+      :
+    else
+      process_list='[]'
+    fi
     resources="$(jq -n \
       --arg elapsed "$elapsed" \
       --arg disk_free_kb "$disk_free_kb" \
@@ -201,13 +209,13 @@ runner_metrics() {
       --arg load_average "$loadavg" \
       --argjson processes "$process_list" \
       '{
-        elapsedSeconds: ($elapsed | tonumber?),
-        diskFreeKb: ($disk_free_kb | tonumber?),
-        memoryTotalKb: ($mem_total_kb | tonumber?),
-        memoryUsedKb: ($mem_used_kb | tonumber?),
-        memoryAvailableKb: ($mem_available_kb | tonumber?),
-        cpuCount: ($cpu_count | tonumber?),
-        cpuPercent: ($cpu_percent | tonumber?),
+        elapsedSeconds: ($elapsed | try tonumber catch null),
+        diskFreeKb: ($disk_free_kb | try tonumber catch null),
+        memoryTotalKb: ($mem_total_kb | try tonumber catch null),
+        memoryUsedKb: ($mem_used_kb | try tonumber catch null),
+        memoryAvailableKb: ($mem_available_kb | try tonumber catch null),
+        cpuCount: ($cpu_count | try tonumber catch null),
+        cpuPercent: ($cpu_percent | try tonumber catch null),
         loadAverage: $load_average,
         processes: $processes
       }')"

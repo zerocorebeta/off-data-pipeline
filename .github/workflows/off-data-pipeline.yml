@@ -11,6 +11,10 @@ on:
         options:
           - fixture
           - full
+      dataset_version:
+        description: 'Optional deterministic dataset version for an operator-triggered full release'
+        required: false
+        type: string
   schedule:
     - cron: '17 3 * * 1'
 
@@ -32,6 +36,7 @@ env:
   OFF_PROGRESS_INTERVAL_SECONDS: 30
   OFF_CHUNK_SIZE: 500000
   OFF_INDEX_MEMORY_MB: 2048
+  OFF_WORKER_THREADS: 6
 
 jobs:
   build-and-upload:
@@ -119,11 +124,11 @@ jobs:
             chunk_size=50000
             index_memory_mb=256
           else
-            dataset="$(date -u +%Y-%m-%d)"
+            dataset="${{ inputs.dataset_version }}"
+            [[ -n "${dataset}" ]] || dataset="$(date -u +%Y-%m-%d)"
             chunk_size="${OFF_CHUNK_SIZE}"
             index_memory_mb="${OFF_INDEX_MEMORY_MB}"
           fi
-          worker_threads="$(nproc)"
           run_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}"
           output="${RUNNER_TEMP}/off-release"
           # Keep every upload name unique so a retry cannot mix a new archive
@@ -137,10 +142,24 @@ jobs:
           fi
           publish_status() {
             [[ "${OFF_MODE}" == full && -s "${status_file}" ]] || return 0
-            scripts/publish-progress.sh "${status_file}" || {
+            scripts/publish-progress.sh "${status_file}" "$@" || {
               echo 'OFF progress status upload failed; continuing the build.' >&2
             }
           }
+          terminal_status() {
+            local code="$?" state=cancelled
+            if [[ "$code" == 0 ]]; then
+              state=success
+            elif [[ "$code" != 130 && "$code" != 143 ]]; then
+              state=failure
+            fi
+            publish_status --state "$state" --exit-code "$code"
+            return "$code"
+          }
+          # EXIT publishes the last complete status; TERM/INT become a
+          # cancellation state before EXIT runs. Publishing is best effort.
+          trap terminal_status EXIT
+          trap 'exit 143' TERM INT
           set +e
           scripts/observe-command.sh "${build_log}" \
             --metrics-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" \
@@ -150,7 +169,7 @@ jobs:
               --input "${OFF_INPUT}" --output "${output}" \
               --dataset-version "${dataset}" --artifact "${artifact}" \
               --chunk-size "${chunk_size}" \
-              --worker-threads "${worker_threads}" \
+              --worker-threads "${OFF_WORKER_THREADS}" \
               --index-memory-mb "${index_memory_mb}" \
               --progress-records "${OFF_PROGRESS_RECORDS}" \
               --progress-interval-seconds "${OFF_PROGRESS_INTERVAL_SECONDS}" &
@@ -166,12 +185,12 @@ jobs:
           wait "${build_pid}"
           build_status="$?"
           set -e
-          publish_status
           [[ "${build_status}" -eq 0 ]] || exit "${build_status}"
           test -s "${output}/off-index-manifest.json"
           test -s "${artifact}"
           echo "OFF_RELEASE=${output}" >> "${GITHUB_ENV}"
           echo "OFF_ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
+          trap - EXIT TERM INT
       - name: Checksum release artifact
         shell: bash
         run: |

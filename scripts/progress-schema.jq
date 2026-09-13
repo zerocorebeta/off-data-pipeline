@@ -1,7 +1,7 @@
 def number_or_null: (type == "number" or type == "null");
 def integer_or_null: (type == "number" and floor == .) or type == "null";
 def known_counter:
-  .key == "phase" or (.value | number_or_null);
+  .key == "phase" or (.key == "compressed_bytes" and (.value | (number_or_null or (type == "string" and test("^[0-9]+/[0-9]+$"))))) or (.value | number_or_null);
 def known_resource:
   .key == "loadAverage" or .key == "processes" or (.value | number_or_null);
 def valid_process:

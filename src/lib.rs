@@ -896,21 +896,56 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
     )
     .or_else(|| {
         non_negative_number(nutriments, &["energy-kj_100g", "energy-kj"]).map(|value| value / 4.184)
+    })
+    .or_else(|| {
+        non_negative_number(
+            nutriments,
+            &[
+                "energy-kcal_prepared_100g",
+                "energy-kcal_prepared_value",
+                "energy-kcal_prepared",
+            ],
+        )
+    })
+    .or_else(|| {
+        non_negative_number(
+            nutriments,
+            &["energy-kj_prepared_100g", "energy-kj_prepared"],
+        )
+        .map(|value| value / 4.184)
     });
     let protein_100g =
-        non_negative_number(nutriments, &["proteins_100g", "protein_100g", "proteins"]);
+        non_negative_number(nutriments, &["proteins_100g", "protein_100g", "proteins"]).or_else(
+            || {
+                non_negative_number(
+                    nutriments,
+                    &["proteins_prepared_100g", "protein_prepared_100g"],
+                )
+            },
+        );
     let carbohydrates_100g = non_negative_number(
         nutriments,
         &["carbohydrates_100g", "carbohydrates_value", "carbohydrates"],
-    );
-    let fat_100g = non_negative_number(nutriments, &["fat_100g", "fat_value", "fat"]);
-    let fiber_100g = non_negative_number(nutriments, &["fiber_100g", "fiber"]);
-    let sugars_100g = non_negative_number(nutriments, &["sugars_100g", "sugars"]);
+    )
+    .or_else(|| non_negative_number(nutriments, &["carbohydrates_prepared_100g"]));
+    let fat_100g = non_negative_number(nutriments, &["fat_100g", "fat_value", "fat"])
+        .or_else(|| non_negative_number(nutriments, &["fat_prepared_100g"]));
+    let fiber_100g = non_negative_number(nutriments, &["fiber_100g", "fiber"])
+        .or_else(|| non_negative_number(nutriments, &["fiber_prepared_100g"]));
+    let sugars_100g = non_negative_number(nutriments, &["sugars_100g", "sugars"])
+        .or_else(|| non_negative_number(nutriments, &["sugars_prepared_100g"]));
     let saturated_fat_100g = non_negative_number(
         nutriments,
         &["saturated-fat_100g", "saturated_fat_100g", "saturated-fat"],
-    );
-    let salt_100g = non_negative_number(nutriments, &["salt_100g", "salt"]);
+    )
+    .or_else(|| {
+        non_negative_number(
+            nutriments,
+            &["saturated-fat_prepared_100g", "saturated_fat_prepared_100g"],
+        )
+    });
+    let salt_100g = non_negative_number(nutriments, &["salt_100g", "salt"])
+        .or_else(|| non_negative_number(nutriments, &["salt_prepared_100g"]));
     if [
         energy_kcal_100g,
         protein_100g,
@@ -1844,6 +1879,32 @@ mod tests {
             .is_none()
         );
         assert!(!valid_barcode("12345678x"));
+    }
+
+    #[test]
+    fn accepts_products_with_only_prepared_nutrition() {
+        let value = serde_json::json!({
+            "code": "8906007283120",
+            "product_name": "Fortune Soya Chunks",
+            "brands": "Adani Wilmar, Fortune",
+            "nutrition_data_prepared": "on",
+            "nutrition_data_prepared_per": "100g",
+            "nutriments": {
+                "energy-kcal_prepared_100g": 343,
+                "proteins_prepared_100g": 52.5,
+                "carbohydrates_prepared_100g": 31.5,
+                "fat_prepared_100g": 1,
+                "salt_prepared_100g": 0.27
+            }
+        });
+
+        let product = normalize_product(&value).expect("prepared product");
+        assert_eq!(product.barcode, "8906007283120");
+        assert_eq!(product.energy_kcal_100g, Some(343.0));
+        assert_eq!(product.protein_100g, Some(52.5));
+        assert_eq!(product.carbohydrates_100g, Some(31.5));
+        assert_eq!(product.fat_100g, Some(1.0));
+        assert_eq!(product.salt_100g, Some(0.27));
     }
 
     #[test]
