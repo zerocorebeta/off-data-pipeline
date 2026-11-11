@@ -650,6 +650,7 @@ struct IndexFields {
     serving_quantity: Field,
     quantity: Field,
     countries: Field,
+    countries_index: Field,
     languages: Field,
     image_url: Field,
     off_product_id: Field,
@@ -678,6 +679,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
     let serving_quantity = b.add_f64_field("serving_quantity", STORED);
     let quantity = b.add_text_field("quantity", STORED);
     let countries = b.add_text_field("countries", STORED);
+    let countries_index = b.add_text_field("countries_index", STRING);
     let languages = b.add_text_field("languages", STORED);
     let image_url = b.add_text_field("image_url", STORED);
     let off_product_id = b.add_text_field("off_product_id", STORED | STRING);
@@ -706,6 +708,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
             serving_quantity,
             quantity,
             countries,
+            countries_index,
             languages,
             image_url,
             off_product_id,
@@ -737,6 +740,9 @@ fn add_product(
         f.off_product_id => product.off_product_id.clone(),
         f.source => product.source.clone(),
     );
+    for country in &product.countries {
+        document.add_text(f.countries_index, country.trim().to_ascii_lowercase());
+    }
     for (field, value) in [
         (f.energy_kcal_100g, product.energy_kcal_100g),
         (f.protein_100g, product.protein_100g),
@@ -1964,6 +1970,30 @@ mod tests {
             "brands": "Example",
             "nutriments": {"energy-kcal_100g": kcal, "proteins_100g": 2.0},
         })
+    }
+
+    #[test]
+    fn country_names_are_indexed_as_individual_exact_terms() {
+        let mut value = raw("12345678", "Rice", 100.0);
+        value["countries_tags"] = serde_json::json!(["en:India", "en:United States"]);
+        let product = normalize_product(&value).unwrap();
+        let (schema, fields) = build_schema();
+        let index = tantivy::Index::create_in_ram(schema);
+        let mut writer = index.writer(16_000_000).unwrap();
+        add_product(&mut writer, fields, &product).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        for (country, expected) in [("india", 1), ("united states", 1), ("france", 0)] {
+            let query = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(fields.countries_index, country),
+                tantivy::schema::IndexRecordOption::Basic,
+            );
+            assert_eq!(
+                searcher.search(&query, &tantivy::collector::Count).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
