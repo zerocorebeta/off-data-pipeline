@@ -34,10 +34,23 @@ The official dump is published at `https://openfoodfacts-ds.s3.eu-west-3.amazona
 
 From this nested checkout, use `scripts/operator.sh preflight` for the upload-free fixture and clean-export checks. Use `scripts/operator.sh progress root@HOST [--run-id ID --run-attempt N]` through existing root/admin SSH access to read the latest heartbeat; it does not use the write-only SFTP account or public HTTP. Use `scripts/operator.sh prepare` followed by the explicit `publish ... --confirm-public` checkpoint to create a standalone public repository, and `scripts/operator.sh configure-secrets` to send SFTP values/files directly to GitHub Actions secrets without printing them. The full bootstrap, restricted SFTP setup, fixture/manual workflow dispatch, activation, rollback, and external prerequisites are documented in [`../docs/off-data.md`](../docs/off-data.md).
 
-After pushing pipeline changes to the standalone repository, regenerate and upload a complete index with one command:
+## Full index refresh
+
+From the `off-data-pipeline` directory in the MacroMeal checkout, run:
 
 ```sh
-./scripts/operator.sh refresh OWNER/OFF-REPO
+./scripts/sync-refresh-activate.sh
 ```
 
-Production activation remains a separate root-controlled checkpoint.
+The defaults target `zerocorebeta/off-data-pipeline` and
+`root@178.104.130.88`. The command synchronizes this pipeline directory to
+GitHub, dispatches and waits for a full OFF build, uploads the verified release,
+activates that exact release on the search service, and verifies OFF status and
+barcode lookup. Override the defaults with:
+
+```sh
+./scripts/sync-refresh-activate.sh OWNER/REPO USER@HOST
+```
+
+For headless execution, provide `GH_TOKEN`; otherwise the script bootstraps it
+from an existing `gh` login.

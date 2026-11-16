@@ -66,6 +66,9 @@ pub struct OffProduct {
     pub sugars_100g: Option<f64>,
     pub saturated_fat_100g: Option<f64>,
     pub salt_100g: Option<f64>,
+    /// Unit of the normalized per-100 nutrition values, independent of serving units.
+    #[serde(default)]
+    pub nutrition_basis_unit: String,
     pub serving_size: String,
     pub serving_quantity: Option<f64>,
     pub quantity: String,
@@ -646,6 +649,7 @@ struct IndexFields {
     sugars_100g: Field,
     saturated_fat_100g: Field,
     salt_100g: Field,
+    nutrition_basis_unit: Field,
     serving_size: Field,
     serving_quantity: Field,
     quantity: Field,
@@ -675,6 +679,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
     let sugars_100g = b.add_f64_field("sugars_100g", STORED);
     let saturated_fat_100g = b.add_f64_field("saturated_fat_100g", STORED);
     let salt_100g = b.add_f64_field("salt_100g", STORED);
+    let nutrition_basis_unit = b.add_text_field("nutrition_basis_unit", STORED);
     let serving_size = b.add_text_field("serving_size", STORED);
     let serving_quantity = b.add_f64_field("serving_quantity", STORED);
     let quantity = b.add_text_field("quantity", STORED);
@@ -704,6 +709,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
             sugars_100g,
             saturated_fat_100g,
             salt_100g,
+            nutrition_basis_unit,
             serving_size,
             serving_quantity,
             quantity,
@@ -732,6 +738,7 @@ fn add_product(
         f.brand => product.brand.clone(),
         f.brand_exact => product.brand.to_ascii_lowercase(),
         f.generic_name => product.generic_name.clone(),
+        f.nutrition_basis_unit => product.nutrition_basis_unit.clone(),
         f.serving_size => product.serving_size.clone(),
         f.quantity => product.quantity.clone(),
         f.countries => join(&product.countries),
@@ -1062,6 +1069,12 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
         sugars_100g,
         saturated_fat_100g,
         salt_100g,
+        nutrition_basis_unit: match string_value(raw, &["nutrition_data_per"]).as_str() {
+            "100ml" => "ml",
+            "100g" => "g",
+            _ => "",
+        }
+        .into(),
         serving_size: string_value(raw, &["serving_size", "serving_size_en"]),
         serving_quantity,
         quantity: string_value(raw, &["quantity"]),
@@ -1249,11 +1262,10 @@ fn collect_runs(
     let compressed_total = fs::metadata(input)?.len();
     let compressed_bytes = Arc::new(AtomicU64::new(0));
     let decompressed_bytes = Arc::new(AtomicU64::new(0));
-    const IO_BUFFER_BYTES: usize = 4 * 1024 * 1024;
     let input_file = CountingReader::new(File::open(input)?, Arc::clone(&compressed_bytes));
-    let decoder = MultiGzDecoder::new(BufReader::with_capacity(IO_BUFFER_BYTES, input_file));
+    let decoder = MultiGzDecoder::new(BufReader::new(input_file));
     let counted_decoder = CountingReader::new(decoder, Arc::clone(&decompressed_bytes));
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, counted_decoder);
+    let mut reader = BufReader::new(counted_decoder);
     let mut products = Vec::with_capacity(chunk_size);
     let mut runs = Vec::new();
     let mut stats = BuildStats::default();
@@ -1992,6 +2004,37 @@ mod tests {
             assert_eq!(
                 searcher.search(&query, &tantivy::collector::Count).unwrap(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_nutrition_units_independently_of_serving_units() {
+        use tantivy::schema::Value;
+        for (data_per, expected) in [("100ml", "ml"), ("100g", "g"), ("serving", "")] {
+            let mut value = raw("12345678", "Drink", 8.0);
+            value["nutrition_data_per"] = serde_json::json!(data_per);
+            value["serving_size"] = serde_json::json!("500ml");
+            let product = normalize_product(&value).unwrap();
+            assert_eq!(product.nutrition_basis_unit, expected);
+            let (schema, fields) = build_schema();
+            let index = tantivy::Index::create_in_ram(schema);
+            let mut writer = index.writer(16_000_000).unwrap();
+            add_product(&mut writer, fields, &product).unwrap();
+            writer.commit().unwrap();
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let address = searcher
+                .search(
+                    &tantivy::query::AllQuery,
+                    &tantivy::collector::TopDocs::with_limit(1),
+                )
+                .unwrap()[0]
+                .1;
+            let doc: tantivy::schema::TantivyDocument = searcher.doc(address).unwrap();
+            assert_eq!(
+                doc.get_first(fields.nutrition_basis_unit).unwrap().as_str(),
+                Some(expected)
             );
         }
     }
