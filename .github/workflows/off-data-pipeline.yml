@@ -19,6 +19,10 @@ on:
         description: 'Optional barcode to trace through bulk-dump ingestion'
         required: false
         type: string
+      trace_expected_unit:
+        description: 'Optional expected nutrition basis (g or ml) for the traced barcode; mismatch fails before upload'
+        required: false
+        type: string
   schedule:
     - cron: '17 3 * * 1'
 
@@ -42,6 +46,7 @@ env:
   OFF_INDEX_MEMORY_MB: 2048
   OFF_WORKER_THREADS: 6
   OFF_TRACE_BARCODE: ${{ inputs.trace_barcode || '' }}
+  OFF_TRACE_EXPECT_UNIT: ${{ inputs.trace_expected_unit || '' }}
 
 jobs:
   build-and-upload:

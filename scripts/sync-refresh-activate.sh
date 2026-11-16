@@ -10,6 +10,8 @@ ACTIVATOR="/usr/local/sbin/macrocodex-food-search-service-activate-off-index"
 INCOMING="/var/lib/macrocodex-food-search-service/off/incoming"
 STATUS_URL="https://search.macrocodex.app/v1/status"
 VERIFY_BARCODE="${VERIFY_BARCODE:-8906007283120}"
+VERIFY_NUTRITION_BASIS_UNIT="${VERIFY_NUTRITION_BASIS_UNIT:-}"
+[[ -z "$VERIFY_NUTRITION_BASIS_UNIT" || "$VERIFY_NUTRITION_BASIS_UNIT" == g || "$VERIFY_NUTRITION_BASIS_UNIT" == ml ]] || { echo 'Expected nutrition basis must be g or ml.' >&2; exit 1; }
 
 fail() { echo "OFF release: $*" >&2; exit 1; }
 for command in curl gh git jq mktemp rsync ssh; do
@@ -47,7 +49,8 @@ head_sha="$(git -C "$workdir/repo" rev-parse HEAD)"
 dataset="$(date -u +%Y-%m-%d-%H%M%S)"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
-  -f mode=full -f dataset_version="$dataset" -f trace_barcode="$VERIFY_BARCODE"
+  -f mode=full -f dataset_version="$dataset" -f trace_barcode="$VERIFY_BARCODE" \
+  -f trace_expected_unit="$VERIFY_NUTRITION_BASIS_UNIT"
 
 run_id=''
 for _ in $(seq 1 30); do
@@ -75,4 +78,9 @@ printf '%s\n' "$status" | jq -e '.off.available == true or .offAvailable == true
 }
 curl --fail --silent --show-error --retry 5 --retry-delay 2 \
   "https://search.macrocodex.app/v1/products/barcode/${VERIFY_BARCODE}" | jq -e . >/dev/null
+if [[ -n "$VERIFY_NUTRITION_BASIS_UNIT" ]]; then
+  curl --fail --silent --show-error --retry 5 --retry-delay 2 \
+    "https://search.macrocodex.app/v1/products/barcode/${VERIFY_BARCODE}" | \
+    jq -e --arg unit "$VERIFY_NUTRITION_BASIS_UNIT" '(.product // .).nutritionBasisUnit == $unit' >/dev/null || fail 'hosted nutrition basis verification failed'
+fi
 echo "OFF release ${dataset} is active; barcode ${VERIFY_BARCODE} is available."

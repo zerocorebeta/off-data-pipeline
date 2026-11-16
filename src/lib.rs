@@ -862,9 +862,32 @@ fn normalized_number(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
+fn legacy_nutrition_basis_unit(raw: &Value) -> Option<&str> {
+    match raw.get("nutrition_data_per")?.as_str()? {
+        "100g" => Some("g"),
+        "100ml" => Some("ml"),
+        // OFF's legacy *_100g fields normalize per-serving nutrition to 100
+        // of the serving's explicit base unit. This is not a density inference.
+        "serving" => match raw.get("serving_quantity_unit")?.as_str()? {
+            "g" => Some("g"),
+            "ml" => Some("ml"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn aggregated_nutrient(raw: &Value, name: &str) -> Option<(f64, String)> {
     let set = raw.get("nutrition")?.get("aggregated_set")?;
-    if set.get("per")?.as_str()? != "100g" {
+    let per = set.get("per")?.as_str()?;
+    if !matches!(per, "100g" | "100ml") {
+        return None;
+    }
+    // Never combine legacy values and aggregate fallback values with different
+    // physical bases when no density conversion is supplied by the source.
+    if let Some(legacy_unit) = legacy_nutrition_basis_unit(raw)
+        && ((legacy_unit == "g" && per != "100g") || (legacy_unit == "ml" && per != "100ml"))
+    {
         return None;
     }
     let nutrient = set.get("nutrients")?.get(name)?;
@@ -1069,12 +1092,20 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
         sugars_100g,
         saturated_fat_100g,
         salt_100g,
-        nutrition_basis_unit: match string_value(raw, &["nutrition_data_per"]).as_str() {
-            "100ml" => "ml",
-            "100g" => "g",
-            _ => "",
-        }
-        .into(),
+        nutrition_basis_unit: legacy_nutrition_basis_unit(raw)
+            .unwrap_or_else(|| {
+                match raw
+                    .get("nutrition")
+                    .and_then(|n| n.get("aggregated_set"))
+                    .and_then(|set| set.get("per"))
+                    .and_then(Value::as_str)
+                {
+                    Some("100ml") => "ml",
+                    Some("100g") => "g",
+                    _ => "",
+                }
+            })
+            .into(),
         serving_size: string_value(raw, &["serving_size", "serving_size_en"]),
         serving_quantity,
         quantity: string_value(raw, &["quantity"]),
@@ -1342,7 +1373,22 @@ fn collect_runs(
                     Err(Some(SkipReason::MissingNutrition)) => "skipped_missing_nutrition",
                     Err(Some(SkipReason::Validation)) => "skipped_validation",
                 };
-                eprintln!("OFF_TRACE barcode={candidate_barcode} ingest={result}");
+                let unit = outcome
+                    .as_ref()
+                    .ok()
+                    .map(|p| p.nutrition_basis_unit.as_str())
+                    .unwrap_or("");
+                eprintln!(
+                    "OFF_TRACE barcode={candidate_barcode} ingest={result} nutrition_basis_unit={unit} {shape}"
+                );
+                if let Ok(expected) = std::env::var("OFF_TRACE_EXPECT_UNIT")
+                    && !expected.is_empty()
+                    && unit != expected
+                {
+                    return Err(PipelineError::InvalidRelease(format!(
+                        "traced barcode {candidate_barcode} nutrition unit {unit:?} does not match {expected:?}"
+                    )));
+                }
             }
             if let Err(Some(reason)) = &outcome {
                 let (index, name) = match reason {
@@ -1401,6 +1447,11 @@ fn collect_runs(
         && !trace_seen
     {
         eprintln!("OFF_TRACE barcode={barcode} ingest=absent_from_dump");
+        if std::env::var("OFF_TRACE_EXPECT_UNIT").is_ok_and(|s| !s.is_empty()) {
+            return Err(PipelineError::InvalidRelease(format!(
+                "required traced barcode {barcode} is absent from dump"
+            )));
+        }
     }
     reporter.publish_stats(
         &stats,
@@ -2037,6 +2088,55 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn current_bulk_volume_basis_is_preserved_and_nutrients_are_imported() {
+        for (per, unit) in [("100ml", "ml"), ("100g", "g")] {
+            let raw = serde_json::json!({
+                "code": "12345678", "product_name": "Drink",
+                "serving_size": "500ml",
+                "nutrition": {"aggregated_set": {"per": per, "nutrients": {
+                    "energy-kcal": {"value": 8, "unit": "kcal"},
+                    "proteins": {"value": 0, "unit": "g"},
+                    "fat": {"value": 0, "unit": "g"},
+                    "carbohydrates": {"value": 2, "unit": "g"}
+                }}}
+            });
+            let product = normalize_product(&raw).expect("bulk nutrition");
+            assert_eq!(product.nutrition_basis_unit, unit);
+            assert_eq!(product.energy_kcal_100g, Some(8.0));
+            assert_eq!(product.carbohydrates_100g, Some(2.0));
+        }
+    }
+
+    #[test]
+    fn legacy_serving_basis_uses_only_explicit_serving_units() {
+        for (unit, expected) in [("ml", "ml"), ("g", "g"), ("", "")] {
+            let raw = serde_json::json!({
+                "code": "12345678", "product_name": "Drink", "nutrition_data_per": "serving",
+                "serving_size": "500ml", "serving_quantity_unit": unit,
+                "nutriments": {"energy-kcal_100g": 8}
+            });
+            assert_eq!(
+                normalize_product(&raw).unwrap().nutrition_basis_unit,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_fallback_never_mixes_grams_and_millilitres() {
+        let raw = serde_json::json!({
+            "code": "12345678", "product_name": "Food", "nutrition_data_per": "100g",
+            "nutriments": {"energy-kcal_100g": 100},
+            "nutrition": {"aggregated_set": {"per": "100ml", "nutrients": {
+                "proteins": {"value": 5, "unit": "g"}
+            }}}
+        });
+        let product = normalize_product(&raw).unwrap();
+        assert_eq!(product.nutrition_basis_unit, "g");
+        assert_eq!(product.protein_100g, None);
     }
 
     #[test]
