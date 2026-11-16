@@ -58,6 +58,8 @@ pub struct OffProduct {
     pub name: String,
     pub brand: String,
     pub generic_name: String,
+    #[serde(default)]
+    pub category_tags: Vec<String>,
     pub energy_kcal_100g: Option<f64>,
     pub protein_100g: Option<f64>,
     pub carbohydrates_100g: Option<f64>,
@@ -116,8 +118,11 @@ impl OffProduct {
                 return Err(format!("{name} must be finite and non-negative"));
             }
         }
-        if self.countries.len() > 256 || self.languages.len() > 256 {
-            return Err("country/language lists are too large".into());
+        if self.countries.len() > 256
+            || self.languages.len() > 256
+            || self.category_tags.len() > 256
+        {
+            return Err("country/language/category lists are too large".into());
         }
         Ok(())
     }
@@ -641,6 +646,7 @@ struct IndexFields {
     brand: Field,
     brand_exact: Field,
     generic_name: Field,
+    category_tags: Field,
     energy_kcal_100g: Field,
     protein_100g: Field,
     carbohydrates_100g: Field,
@@ -671,6 +677,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
     let brand = b.add_text_field("brand", STORED | TEXT);
     let brand_exact = b.add_text_field("brand_exact", STORED | STRING);
     let generic_name = b.add_text_field("generic_name", STORED | TEXT);
+    let category_tags = b.add_text_field("category_tags", STORED);
     let energy_kcal_100g = b.add_f64_field("energy_kcal_100g", STORED);
     let protein_100g = b.add_f64_field("protein_100g", STORED);
     let carbohydrates_100g = b.add_f64_field("carbohydrates_100g", STORED);
@@ -701,6 +708,7 @@ fn build_schema() -> (tantivy::schema::Schema, IndexFields) {
             brand,
             brand_exact,
             generic_name,
+            category_tags,
             energy_kcal_100g,
             protein_100g,
             carbohydrates_100g,
@@ -738,6 +746,7 @@ fn add_product(
         f.brand => product.brand.clone(),
         f.brand_exact => product.brand.to_ascii_lowercase(),
         f.generic_name => product.generic_name.clone(),
+        f.category_tags => join(&product.category_tags),
         f.nutrition_basis_unit => product.nutrition_basis_unit.clone(),
         f.serving_size => product.serving_size.clone(),
         f.quantity => product.quantity.clone(),
@@ -1084,6 +1093,7 @@ fn normalize_product_with_reason(raw: &Value) -> Result<OffProduct, SkipReason> 
         name,
         brand: string_value(raw, &["brands", "brand_owner", "brand"]),
         generic_name,
+        category_tags: list_value(raw, &["categories_tags", "categories_hierarchy"]),
         energy_kcal_100g,
         protein_100g,
         carbohydrates_100g,
@@ -2033,6 +2043,46 @@ mod tests {
             "brands": "Example",
             "nutriments": {"energy-kcal_100g": kcal, "proteins_100g": 2.0},
         })
+    }
+
+    #[test]
+    fn bulk_categories_survive_normalization_and_index_storage() {
+        use tantivy::schema::Value as _;
+        let mut value = raw("12345678", "Amul Masti", 65.0);
+        value["categories_tags"] = serde_json::json!(["en:yogurts", "en:dairies"]);
+        let product = normalize_product(&value).unwrap();
+        assert_eq!(product.category_tags, vec!["en:dairies", "en:yogurts"]);
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer(16_000_000).unwrap();
+        add_product(&mut writer, fields, &product).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let hits = searcher
+            .search(
+                &tantivy::query::AllQuery,
+                &tantivy::collector::TopDocs::with_limit(1),
+            )
+            .unwrap();
+        let document = searcher
+            .doc::<tantivy::schema::TantivyDocument>(hits[0].1)
+            .unwrap();
+        assert_eq!(
+            document.get_first(fields.category_tags).unwrap().as_str(),
+            Some("en:dairies\u{1f}en:yogurts")
+        );
+        value.as_object_mut().unwrap().remove("categories_tags");
+        value["categories_hierarchy"] = serde_json::json!(["en:cheeses"]);
+        assert_eq!(
+            normalize_product(&value).unwrap().category_tags,
+            vec!["en:cheeses"]
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("categories_hierarchy");
+        assert!(normalize_product(&value).unwrap().category_tags.is_empty());
     }
 
     #[test]

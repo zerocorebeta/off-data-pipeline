@@ -4,3 +4,4 @@
 *.jsonl.gz
 *.tar.zst
 !/tests/fixtures/products.jsonl.gz
+!/tests/fixtures/icon-products.jsonl
